@@ -1,0 +1,872 @@
+{% extends "base.html" %}
+{% from "macros.html" import scan_freshness, soft_allow_glance, pretrade_glance, next_buy_glance, book_risk_glance, ledger_health_glance, entry_gates_glance, calm_streak_glance, promote_ab_glance, crypto_policy_glance, exit_policy_glance, earnings_blackout_glance, ai_mode_glance, ai_roles_glance, laya_glance, ai_debate_glance, ai_validate_scope_glance, session_glance, equity_hours_glance, breakout_guard_glance, loss_rotation_glance, stale_rotation_glance, book_posture_glance, junk_filter_glance, universe_discovery_glance, atr_display_glance, entry_slots_glance, promote_contract_glance, gate_roles_glance, gate_params_glance, book_limits_glance, rebuy_cooldown_glance, daily_loss_glance, concentration_glance, listed_fund_overlap_glance, post_sl_cooldown_glance, loop_cadence_glance, improve_tick_glance, fee_allowance_glance, fee_burn_glance, stuck_capital_glance, min_hold_lock_glance, postmortem_glance %}
+{% block content %}
+<header class="page-head">
+  <p class="eyebrow">Breadth</p>
+  <h1>Session &amp; exposure</h1>
+  <p class="lede">Market-regime style snapshot for our paper stack — session mode, deployment, and scan coverage.</p>
+  {{ scan_freshness(snap) }}
+</header>
+
+{{ pretrade_glance(
+  snap,
+  "breadth-pretrade-h",
+  "/desk",
+  "Overview →",
+  "Checklist beside breadth — FAIL blocks buys; WARN is fee burn / cooldown."
+) }}
+
+{{ next_buy_glance(
+  snap,
+  "breadth-size-h",
+  "/desk",
+  "Overview size →",
+  "Suggested next-buy € beside breadth — display only; not a gate."
+) }}
+
+{{ soft_allow_glance(snap) }}
+
+{{ entry_gates_glance(
+  snap,
+  "breadth-gates-h",
+  "/desk/ops#cfg-h",
+  "Ops knobs →",
+  "Soft entry filters beside breadth — display only; flip on Ops."
+) }}
+
+{{ calm_streak_glance(
+  snap,
+  "breadth-calm-h",
+  "/desk/ops#calm-h",
+  "Ops calm →",
+  "Promote compose-default unlock beside breadth — calm ≠ edge; detail on Ops."
+) }}
+
+{{ promote_ab_glance(
+  snap,
+  "breadth-promote-ab-h",
+  "/desk/ops#ops-promote",
+  "Ops promote →",
+  "Fee-adjusted A/B window beside breadth — do not flip promote mid-window. Not edge."
+) }}
+
+{{ book_posture_glance(
+  snap,
+  "breadth-book-posture-h",
+  "/desk/book",
+  "Book →",
+  "Live open/at_cap/overweight vs max; overweight names next trim (winners first). Display only."
+) }}
+
+{{ book_risk_glance(
+  snap,
+  "breadth-book-risk-h",
+  "/desk/book",
+  "Full book →",
+  "Slots and posture beside breadth — overweight means exits-only."
+) }}
+
+{# MonsterDeveloper simplicity: keep first viewport short; policy lines stay available. #}
+{% set policy_meta = snap.policy_honesty_meta|default('crypto · exits · AI · gates · fees') %}
+{% set policy_warn = snap.policy_honesty_warn|default(false) %}
+<details class="policy-honesty{% if policy_warn %} warn{% endif %}" id="policy-honesty"{% if policy_warn %} open{% endif %}>
+  <summary>Policy honesty <span class="meta">{{ policy_meta }}</span></summary>
+  <p class="sub">Display-only rules. Not new entry gates. Ops keeps the toggles.</p>
+
+{{ crypto_policy_glance(
+  snap,
+  "breadth-crypto-h",
+  "/desk/screener#crypto-h",
+  "Screener crypto →",
+  "Live crypto slot beside breadth — BTC/ETH only · one slot · ±10% exits. Not a gate."
+) }}
+
+{{ exit_policy_glance(
+  snap,
+  "breadth-exit-h",
+  "/desk/book",
+  "Book →",
+  "Stock exit bands beside breadth — TP +8% / SL −5% / rotate ≥+5%. Not ATR."
+) }}
+
+{{ earnings_blackout_glance(
+  snap,
+  "breadth-earnings-h",
+  "/desk/screener",
+  "Screener →",
+  "Stock blackout 2d/1d; empty/bad Yahoo → allow (suspect); crypto exempt."
+) }}
+
+{{ ai_mode_glance(
+  snap,
+  "breadth-ai-h",
+  "/desk/ops#ops-ai-mode",
+  "Ops AI →",
+  "AI path beside breadth — off / validate / full + multi-role. Rules first. Not a gate."
+) }}
+
+{{ ai_roles_glance(
+  snap,
+  "breadth-ai-roles-h",
+  "/desk/ideas",
+  "Ideas →",
+  "Multi-role beside breadth — bull/bear/risk; disagreement or risk veto → HOLD. Display only."
+) }}
+
+{{ laya_glance(
+  snap,
+  "breadth-laya-h",
+  "/desk/ops#ops-ai-mode",
+  "Ops AI →",
+  "Beside breadth — last advisory vs scan clock; clash if they disagree. Fail-open; not a gate."
+) }}
+
+{{ ai_debate_glance(
+  snap,
+  "breadth-ai-debate-h",
+  "/desk/ideas#debate-h",
+  "Ideas debates →",
+  "Beside breadth — recent validate memory; display only."
+) }}
+
+{{ ai_validate_scope_glance(
+  snap,
+  "breadth-ai-scope-h",
+  "/desk/ops#ops-ai-mode",
+  "Ops AI →",
+  "Top-N LLM scope beside breadth — rest keep scanner score. Display only."
+) }}
+
+{{ session_glance(
+  snap,
+  "breadth-session-h",
+  "/desk/screener",
+  "Screener →",
+  "UTC session beside breadth — weekend is crypto-only. Not a gate."
+) }}
+
+{{ equity_hours_glance(
+  snap,
+  "breadth-equity-hours-h",
+  "/desk/screener",
+  "Screener →",
+  "Live US vs Xetra beside breadth — .DE is not US hours; crypto 24/7."
+) }}
+
+{{ breakout_guard_glance(
+  snap,
+  "breadth-breakout-h",
+  "/desk/screener#brk-h",
+  "Breakouts →",
+  "Breakout entry guards beside breadth — AI BUY · LOW blocked · pullback. Display only."
+) }}
+
+{{ loss_rotation_glance(
+  snap,
+  "breadth-loss-rot-h",
+  "/desk/book",
+  "Book →",
+  "No loss-rotation beside breadth — losers stay; rotate winners only. Display only."
+) }}
+
+{{ stale_rotation_glance(
+  snap,
+  "breadth-stale-rot-h",
+  "/desk/book",
+  "Book →",
+  "Stale rotation beside breadth — off full scan list + top-N replacement. Display only."
+) }}
+
+{{ junk_filter_glance(
+  snap,
+  "breadth-junk-h",
+  "/desk/screener",
+  "Screener →",
+  "Junk/noise filters beside breadth — stables/leveraged dropped; crypto ≥ $1. Display only."
+) }}
+
+{{ universe_discovery_glance(
+  snap,
+  "breadth-universe-h",
+  "/desk/screener",
+  "Screener →",
+  "Universe discovery beside breadth — Yahoo movers grow US+DE scan only; not auto-buy."
+) }}
+
+{{ atr_display_glance(
+  snap,
+  "breadth-atr-h",
+  "/desk/screener",
+  "Screener →",
+  "ATR / R:R beside breadth — Screener notes are display-only; live exits use TP/SL."
+) }}
+
+{{ entry_slots_glance(
+  snap,
+  "breadth-entry-slots-h",
+  "/desk/screener",
+  "Screener →",
+  "Beside breadth — entry ranking honesty (score band + interleave). Display only."
+) }}
+
+{{ promote_contract_glance(
+  snap,
+  "breadth-promote-contract-h",
+  "/desk/ops#ops-promote",
+  "Ops promote →",
+  "Beside breadth — promote is entry veto only; not a new gate."
+) }}
+
+{{ gate_roles_glance(
+  snap,
+  "breadth-gate-roles-h",
+  "/desk/ops#ops-regime",
+  "Ops gates →",
+  "Beside breadth — regime abs · RS rel · scan A/D roles; starve→RS off first."
+) }}
+
+{{ gate_params_glance(
+  snap,
+  "breadth-gate-params-h",
+  "/desk/ops#ops-regime",
+  "Ops gates →",
+  "Beside breadth — SMA / RS lookback / scan A/D mins; fail-open. Display only."
+) }}
+
+{{ book_limits_glance(
+  snap,
+  "breadth-book-limits-h",
+  "/desk/ops#ops-max-pos",
+  "Ops book →",
+  "Slots · min hold · fee preset beside breadth — packaging ≠ edge. Not a gate."
+) }}
+
+{{ rebuy_cooldown_glance(
+  snap,
+  "breadth-rebuy-h",
+  "/desk/ops#ops-min-hold",
+  "Ops hold →",
+  "Same-symbol rebuy lock beside breadth — SCHW flip-flop honesty. Not a gate."
+) }}
+
+{{ daily_loss_glance(
+  snap,
+  "breadth-day-loss-h",
+  "/desk#pretrade-h",
+  "Pre-trade →",
+  "UTC-day realized vs −2% halt beside breadth — headroom before FAIL. Soft buy block only."
+) }}
+
+{{ concentration_glance(
+  snap,
+  "breadth-conc-h",
+  "/desk/book",
+  "Book →",
+  "Largest name vs 30% entry cap beside breadth — headroom before size blocks. Soft fill limit only."
+) }}
+
+{{ listed_fund_overlap_glance(
+  snap,
+  "breadth-fund-overlap-h",
+  "/desk/book",
+  "Book →",
+  "Same-theme ETF/ETC doubles (gold · silver · US equity) — name overlap ≠ single-name cap. Display only."
+) }}
+
+{{ post_sl_cooldown_glance(
+  snap,
+  "breadth-post-sl-h",
+  "/desk#pretrade-h",
+  "Pre-trade →",
+  "After SL, ≥4h buy block beside breadth — anti revenge refill."
+) }}
+
+{{ loop_cadence_glance(
+  snap,
+  "breadth-loop-cadence-h",
+  "/desk/ops#ops-scan-trade",
+  "Ops cadence →",
+  "Scan vs trade sleep beside breadth — floors ≥15m / ≥5m. Packaging ≠ edge."
+) }}
+
+{{ improve_tick_glance(
+  snap,
+  "breadth-improve-tick-h",
+  "/desk/ops#logs-h",
+  "Ops logs →",
+  "Last Cursor improve tick vs hourly cadence — fresh ≤75m · aging ≤3h · else stale. Display only."
+) }}
+
+{{ fee_allowance_glance(
+  snap,
+  "breadth-fee-allowance-h",
+  "/desk/ops#ops-fee-preset",
+  "Ops fees →",
+  "Free monthly legs beside breadth — Revolut-like quota; crypto fees not modeled. Not a gate."
+) }}
+
+{{ fee_burn_glance(
+  snap,
+  "breadth-fee-burn-h",
+  "/desk/ops#ops-fee-preset",
+  "Ops fees →",
+  "Fee drag vs start and realized P&L beside breadth — high (≥2% or fees>P&L) before chasing adds. Not a gate."
+) }}
+
+{{ stuck_capital_glance(
+  snap,
+  "breadth-stuck-h",
+  "/desk/book",
+  "Book →",
+  "Past min-hold underwater beside breadth — capital trapped until TP/SL/trim."
+) }}
+
+{{ min_hold_lock_glance(
+  snap,
+  "breadth-min-hold-lock-h",
+  "/desk/ops#ops-min-hold",
+  "Ops hold →",
+  "Lots still inside min-hold beside breadth — cannot rotate/trim yet. Not a gate."
+) }}
+
+{{ postmortem_glance(
+  snap,
+  "breadth-post-h",
+  "/desk/book#post-h",
+  "Book rounds →",
+  "Newest closed round beside breadth — full thesis list on Book. Not a gate."
+) }}
+
+</details>
+
+<section class="strip" aria-label="Exposure meters">
+  <div>
+    <span class="k">Deployed</span>
+    <span class="v">{{ "%.0f"|format(snap.deployed_pct) }}%</span>
+  </div>
+  <div>
+    <span class="k">Cash</span>
+    <span class="v">€{{ "{:,.0f}".format(snap.cash) }}</span>
+  </div>
+  <div>
+    <span class="k">Positions</span>
+    <span class="v">{{ snap.positions }}</span>
+  </div>
+  <div>
+    <span class="k">Fee drag</span>
+    <span class="v">€{{ "{:,.2f}".format(snap.fees) }}</span>
+  </div>
+</section>
+
+<section class="block" aria-labelledby="pulse-h">
+  {% set pulse = snap.scan_breadth if snap.scan_breadth is mapping else {} %}
+  <h2 id="pulse-h">Scan pulse</h2>
+  <p class="sub">{{ pulse.note|default("Scan-list pulse (leaders/breakouts), not full-universe advance/decline.") }}</p>
+  <section class="strip" aria-label="Scan breadth pulse">
+    <div>
+      <span class="k">Crypto A/D</span>
+      <span class="v">{{ pulse.crypto_up|default(0) }} / {{ pulse.crypto_down|default(0) }}</span>
+      {% if pulse.crypto_advance_pct is not none %}
+      <span class="weight">of {{ pulse.crypto_n|default(0) }} leaders · advance {{ "%.0f"|format(pulse.crypto_advance_pct) }}% · flat {{ pulse.crypto_flat|default(0) }} · StockBee-lite</span>
+      {% else %}
+      <span class="weight">of {{ pulse.crypto_n|default(0) }} leaders · flat {{ pulse.crypto_flat|default(0) }}</span>
+      {% endif %}
+    </div>
+    <div>
+      <span class="k">Crypto avg 24h</span>
+      {% if pulse.crypto_avg_chg is not none %}
+      <span class="v {% if pulse.crypto_avg_chg >= 0 %}up{% else %}down{% endif %}">
+        {{ "%+.1f"|format(pulse.crypto_avg_chg) }}%
+      </span>
+      {% else %}
+      <span class="v meta" title="No readable 24h % on leaders this scan">n/a</span>
+      {% endif %}
+    </div>
+    <div>
+      <span class="k">±4% movers</span>
+      <span class="v">{{ pulse.crypto_big_movers|default(0) }}</span>
+      {% if pulse.crypto_mover_pct is not none %}
+      <span class="weight">{{ "%.0f"|format(pulse.crypto_mover_pct) }}% of {{ pulse.crypto_n|default(0) }} leaders · StockBee-lite</span>
+      {% else %}
+      <span class="weight">StockBee-style big moves in leaders</span>
+      {% endif %}
+    </div>
+    <div>
+      <span class="k">Near highs</span>
+      <span class="v">{{ pulse.stock_within_5pct_high|default(0) }}</span>
+      {% if pulse.near_high_pct is not none %}
+      <span class="weight">{{ "%.0f"|format(pulse.near_high_pct) }}% of {{ pulse.stock_breakouts_n|default(0) }} breakouts ≤5% from high · StockBee-lite</span>
+      {% else %}
+      <span class="weight">of {{ pulse.stock_breakouts_n|default(0) }} breakouts ≤5% from high</span>
+      {% endif %}
+    </div>
+    <div>
+      <span class="k">Thrust</span>
+      {% set thrust_sum = snap.breadth_thrust_summary if snap.breadth_thrust_summary is mapping else {} %}
+      {% if pulse.is_confirmed_thrust %}
+      <span class="v up">confirmed</span>
+      <span class="weight">
+        ±4% + near-high ≥25% and risk-on · StockBee-lite · not a gate
+        {% if thrust_sum.ready and thrust_sum.confirmed_streak and thrust_sum.confirmed_streak >= 2 %}
+        · confirmed streak {{ thrust_sum.confirmed_streak }}
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.confirm_rate_pct is not none %}
+        · confirm {{ "%.0f"|format(thrust_sum.confirm_rate_pct) }}% of thrust ({{ thrust_sum.confirmed_n }}/{{ thrust_sum.thrust_n }})
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.density_pct is not none %}
+        · density {{ "%.0f"|format(thrust_sum.density_pct) }}% ({{ thrust_sum.thrust_n }}/{{ thrust_sum.days }} days)
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.confirmed_density_pct is not none %}
+        · confirmed dens {{ "%.0f"|format(thrust_sum.confirmed_density_pct) }}% ({{ thrust_sum.confirmed_n }}/{{ thrust_sum.days }})
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.alone_density_pct is not none %}
+        · alone dens {{ "%.0f"|format(thrust_sum.alone_density_pct) }}% ({{ thrust_sum.alone_n }}/{{ thrust_sum.days }})
+        {% endif %}
+      </span>
+      {% elif pulse.is_thrust %}
+      <span class="v">alone</span>
+      <span class="weight">
+        ±4% and near-high both ≥25% · not risk-on · StockBee-lite · not a gate
+        {% if thrust_sum.ready and thrust_sum.alone_streak and thrust_sum.alone_streak >= 2 %}
+        · alone streak {{ thrust_sum.alone_streak }}
+        {% elif thrust_sum.ready and thrust_sum.streak and thrust_sum.streak >= 2 %}
+        · streak {{ thrust_sum.streak }}
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.confirm_rate_pct is not none %}
+        · confirm {{ "%.0f"|format(thrust_sum.confirm_rate_pct) }}% of thrust ({{ thrust_sum.confirmed_n }}/{{ thrust_sum.thrust_n }})
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.density_pct is not none %}
+        · density {{ "%.0f"|format(thrust_sum.density_pct) }}% ({{ thrust_sum.thrust_n }}/{{ thrust_sum.days }} days)
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.confirmed_density_pct is not none %}
+        · confirmed dens {{ "%.0f"|format(thrust_sum.confirmed_density_pct) }}% ({{ thrust_sum.confirmed_n }}/{{ thrust_sum.days }})
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.alone_density_pct is not none %}
+        · alone dens {{ "%.0f"|format(thrust_sum.alone_density_pct) }}% ({{ thrust_sum.alone_n }}/{{ thrust_sum.days }})
+        {% endif %}
+      </span>
+      {% else %}
+      <span class="v">no</span>
+      <span class="weight">
+        needs both ratios ≥25% · scan-list only
+        {% if thrust_sum.ready and thrust_sum.days_since_confirmed and thrust_sum.days_since_confirmed > 0 %}
+        · {{ thrust_sum.days_since_confirmed }}d since confirmed
+        {% elif thrust_sum.ready and thrust_sum.days_since_alone and thrust_sum.days_since_alone > 0 %}
+        · {{ thrust_sum.days_since_alone }}d since alone
+        {% elif thrust_sum.ready and thrust_sum.days_since and thrust_sum.days_since > 0 %}
+        · {{ thrust_sum.days_since }}d since thrust
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.confirm_rate_pct is not none %}
+        · confirm {{ "%.0f"|format(thrust_sum.confirm_rate_pct) }}% of thrust ({{ thrust_sum.confirmed_n }}/{{ thrust_sum.thrust_n }})
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.density_pct is not none %}
+        · density {{ "%.0f"|format(thrust_sum.density_pct) }}% ({{ thrust_sum.thrust_n }}/{{ thrust_sum.days }} days)
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.confirmed_density_pct is not none %}
+        · confirmed dens {{ "%.0f"|format(thrust_sum.confirmed_density_pct) }}% ({{ thrust_sum.confirmed_n }}/{{ thrust_sum.days }})
+        {% endif %}
+        {% if thrust_sum.ready and thrust_sum.alone_density_pct is not none %}
+        · alone dens {{ "%.0f"|format(thrust_sum.alone_density_pct) }}% ({{ thrust_sum.alone_n }}/{{ thrust_sum.days }})
+        {% endif %}
+      </span>
+      {% endif %}
+    </div>
+    <div>
+      <span class="k">Tape</span>
+      {% set tape_sum = snap.breadth_tape_summary if snap.breadth_tape_summary is mapping else {} %}
+      {% if pulse.tape_label == "risk-on" %}
+      <span class="v up">risk-on</span>
+      <span class="weight">
+        stock + crypto advance both ≥50% · dual advance · not a gate
+        {% if tape_sum.ready and tape_sum.dual_streak and tape_sum.dual_streak >= 2 %}
+        · streak {{ tape_sum.dual_streak }}
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.days_since_risk_off and tape_sum.days_since_risk_off > 0 %}
+        · {{ tape_sum.days_since_risk_off }}d since risk-off
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.days_since_tape_split and tape_sum.days_since_tape_split > 0 %}
+        · {{ tape_sum.days_since_tape_split }}d since split
+        {% endif %}
+
+        {% if tape_sum.ready and tape_sum.risk_on_density_pct is not none %}
+        · risk-on dens {{ "%.0f"|format(tape_sum.risk_on_density_pct) }}% ({{ tape_sum.dual_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.split_density_pct is not none %}
+        · split dens {{ "%.0f"|format(tape_sum.split_density_pct) }}% ({{ tape_sum.split_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.risk_off_density_pct is not none %}
+        · risk-off dens {{ "%.0f"|format(tape_sum.risk_off_density_pct) }}% ({{ tape_sum.risk_off_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.mixed_density_pct is not none %}
+        · mixed dens {{ "%.0f"|format(tape_sum.mixed_density_pct) }}% ({{ tape_sum.mixed_n }}/{{ tape_sum.days }})
+        {% endif %}
+      </span>
+      {% elif pulse.tape_label == "split" %}
+      <span class="v down">split</span>
+      <span class="weight">
+        one ≥60% advance · other ≤40% · cross-asset · not a gate
+        {% if tape_sum.ready and tape_sum.split_streak and tape_sum.split_streak >= 2 %}
+        · streak {{ tape_sum.split_streak }}
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.days_since_risk_on and tape_sum.days_since_risk_on > 0 %}
+        · {{ tape_sum.days_since_risk_on }}d since risk-on
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.days_since_risk_off and tape_sum.days_since_risk_off > 0 %}
+        · {{ tape_sum.days_since_risk_off }}d since risk-off
+        {% endif %}
+
+        {% if tape_sum.ready and tape_sum.risk_on_density_pct is not none %}
+        · risk-on dens {{ "%.0f"|format(tape_sum.risk_on_density_pct) }}% ({{ tape_sum.dual_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.split_density_pct is not none %}
+        · split dens {{ "%.0f"|format(tape_sum.split_density_pct) }}% ({{ tape_sum.split_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.risk_off_density_pct is not none %}
+        · risk-off dens {{ "%.0f"|format(tape_sum.risk_off_density_pct) }}% ({{ tape_sum.risk_off_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.mixed_density_pct is not none %}
+        · mixed dens {{ "%.0f"|format(tape_sum.mixed_density_pct) }}% ({{ tape_sum.mixed_n }}/{{ tape_sum.days }})
+        {% endif %}
+      </span>
+      {% elif pulse.tape_label == "risk-off" %}
+      <span class="v down">risk-off</span>
+      <span class="weight">
+        stock + crypto advance both ≤40% · dual weakness · not a gate
+        {% if tape_sum.ready and tape_sum.risk_off_streak and tape_sum.risk_off_streak >= 2 %}
+        · streak {{ tape_sum.risk_off_streak }}
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.days_since_risk_on and tape_sum.days_since_risk_on > 0 %}
+        · {{ tape_sum.days_since_risk_on }}d since risk-on
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.days_since_tape_split and tape_sum.days_since_tape_split > 0 %}
+        · {{ tape_sum.days_since_tape_split }}d since split
+        {% endif %}
+
+        {% if tape_sum.ready and tape_sum.risk_on_density_pct is not none %}
+        · risk-on dens {{ "%.0f"|format(tape_sum.risk_on_density_pct) }}% ({{ tape_sum.dual_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.split_density_pct is not none %}
+        · split dens {{ "%.0f"|format(tape_sum.split_density_pct) }}% ({{ tape_sum.split_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.risk_off_density_pct is not none %}
+        · risk-off dens {{ "%.0f"|format(tape_sum.risk_off_density_pct) }}% ({{ tape_sum.risk_off_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.mixed_density_pct is not none %}
+        · mixed dens {{ "%.0f"|format(tape_sum.mixed_density_pct) }}% ({{ tape_sum.mixed_n }}/{{ tape_sum.days }})
+        {% endif %}
+      </span>
+      {% elif pulse.tape_label == "mixed" %}
+      <span class="v">mixed</span>
+      <span class="weight">
+        both sleeves priced · mid-range · not risk-on/split/risk-off · not a gate
+        {% if tape_sum.ready and tape_sum.mixed_streak and tape_sum.mixed_streak >= 2 %}
+        · streak {{ tape_sum.mixed_streak }}
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.days_since_risk_on and tape_sum.days_since_risk_on > 0 %}
+        · {{ tape_sum.days_since_risk_on }}d since risk-on
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.days_since_risk_off and tape_sum.days_since_risk_off > 0 %}
+        · {{ tape_sum.days_since_risk_off }}d since risk-off
+        {% endif %}
+
+        {% if tape_sum.ready and tape_sum.risk_on_density_pct is not none %}
+        · risk-on dens {{ "%.0f"|format(tape_sum.risk_on_density_pct) }}% ({{ tape_sum.dual_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.split_density_pct is not none %}
+        · split dens {{ "%.0f"|format(tape_sum.split_density_pct) }}% ({{ tape_sum.split_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.risk_off_density_pct is not none %}
+        · risk-off dens {{ "%.0f"|format(tape_sum.risk_off_density_pct) }}% ({{ tape_sum.risk_off_n }}/{{ tape_sum.days }})
+        {% endif %}
+        {% if tape_sum.ready and tape_sum.mixed_density_pct is not none %}
+        · mixed dens {{ "%.0f"|format(tape_sum.mixed_density_pct) }}% ({{ tape_sum.mixed_n }}/{{ tape_sum.days }})
+        {% endif %}
+      </span>
+      {% else %}
+      <span class="v">—</span>
+      <span class="weight">needs both sleeves priced · dual ≥50% · 60/40 split · both ≤40% · or mid mixed</span>
+      {% endif %}
+      {% if tape_sum.ready and tape_sum.tape_flip %}
+      <span class="weight"> · flipped {{ tape_sum.prev_label }}→{{ tape_sum.latest_label }}</span>
+      {% if tape_sum.flip_streak and tape_sum.flip_streak >= 2 %}
+      <span class="weight"> · flip streak {{ tape_sum.flip_streak }}</span>
+      {% endif %}
+      {% elif tape_sum.ready and tape_sum.days_since_tape_flip and tape_sum.days_since_tape_flip > 0 %}
+      <span class="weight"> · {{ tape_sum.days_since_tape_flip }}d since flip</span>
+      {% endif %}
+      {% if tape_sum.ready and tape_sum.flip_density_pct is not none %}
+      <span class="weight"> · flip dens {{ "%.0f"|format(tape_sum.flip_density_pct) }}% ({{ tape_sum.flip_n }}/{{ tape_sum.pair_n }})</span>
+      {% endif %}
+      {% if tape_sum.chop_ready %}
+      {% set chop_warn = tape_sum.chop_warn|default(false) %}
+      {% set chop_meta = tape_sum.chop_meta|default('quiet') %}
+      <details class="chop-honesty{% if chop_warn %} warn{% endif %}" id="chop-honesty"{% if chop_warn %} open{% endif %}>
+        <summary>Flip-run chop <span class="meta">{{ chop_meta }}</span></summary>
+        <p class="sub">StockBee storm-size distribution — scan-list only; display only; not a gate.</p>
+        <p class="weight{% if chop_warn %} warn{% endif %}">{{ tape_sum.chop_line }}</p>
+      </details>
+      {% endif %}
+    </div>
+    <div>
+      <span class="k">Stock batch A/D</span>
+      <span class="v">{{ pulse.stock_scan_up|default(0) }} / {{ pulse.stock_scan_down|default(0) }}</span>
+      {% if pulse.stock_advance_pct is not none %}
+      <span class="weight">of {{ pulse.stock_scan_n|default(0) }} priced · advance {{ "%.0f"|format(pulse.stock_advance_pct) }}% · flat {{ pulse.stock_scan_flat|default(0) }} · StockBee-lite</span>
+      {% else %}
+      <span class="weight">of {{ pulse.stock_scan_n|default(0) }} priced this cycle · flat {{ pulse.stock_scan_flat|default(0) }}</span>
+      {% endif %}
+    </div>
+  </section>
+  {% if snap.scan_breadth_history %}
+  <h3 class="subhead">Recent days</h3>
+  {% set thrust = snap.breadth_thrust_summary if snap.breadth_thrust_summary is mapping else {} %}
+  {% set tape = snap.breadth_tape_summary if snap.breadth_tape_summary is mapping else {} %}
+  <p class="sub">
+    One UTC snapshot per day from our scan lists (not the full market).
+    Open a day scan log to see the names behind the counts.
+    {% if thrust.ready %}
+    <span class="weight"> · {{ thrust.line }}</span>
+    {% endif %}
+    {% if tape.ready %}
+    <span class="weight"> · {{ tape.line }}</span>
+    {% endif %}
+  </p>
+  {% set spark = snap.breadth_ad_spark if snap.breadth_ad_spark is mapping else {} %}
+  {% set stock_spark = snap.breadth_stock_ad_spark if snap.breadth_stock_ad_spark is mapping else {} %}
+  {% set mover_spark = snap.breadth_mover_spark if snap.breadth_mover_spark is mapping else {} %}
+  {% set near_spark = snap.breadth_near_high_spark if snap.breadth_near_high_spark is mapping else {} %}
+  {% set adv_spark = snap.breadth_stock_advance_spark if snap.breadth_stock_advance_spark is mapping else {} %}
+  {% set crypto_adv_spark = snap.breadth_crypto_advance_spark if snap.breadth_crypto_advance_spark is mapping else {} %}
+  {% if spark.ready or stock_spark.ready or mover_spark.ready or near_spark.ready or adv_spark.ready or crypto_adv_spark.ready %}
+  <div class="breadth-ad-sparks" aria-label="Multi-day A/D, ±4%, near-high, and advance ratio sparklines">
+    {% if spark.ready %}
+    <figure class="breadth-ad-spark" id="breadth-ad-spark">
+      {{ spark.svg|safe }}
+      <figcaption>
+        Crypto A/D net (up − down) · {{ spark.n }} days ·
+        latest
+        <span class="v {% if spark.latest_net >= 0 %}up{% else %}down{% endif %}">
+          {{ "%+d"|format(spark.latest_net) }}
+        </span>
+        · {{ spark.first_day }} → {{ spark.last_day }}
+      </figcaption>
+    </figure>
+    {% endif %}
+    {% if stock_spark.ready %}
+    <figure class="breadth-ad-spark" id="breadth-stock-ad-spark">
+      {{ stock_spark.svg|safe }}
+      <figcaption>
+        Stock batch A/D net · {{ stock_spark.n }} days ·
+        latest
+        <span class="v {% if stock_spark.latest_net >= 0 %}up{% else %}down{% endif %}">
+          {{ "%+d"|format(stock_spark.latest_net) }}
+        </span>
+        · {{ stock_spark.first_day }} → {{ stock_spark.last_day }}
+      </figcaption>
+    </figure>
+    {% endif %}
+    {% if mover_spark.ready %}
+    <figure class="breadth-ad-spark" id="breadth-mover-spark">
+      {{ mover_spark.svg|safe }}
+      <figcaption>
+        ±4% ratio (% of crypto leaders) · {{ mover_spark.n }} days ·
+        latest
+        <span class="v {% if mover_spark.tone == 'up' %}up{% elif mover_spark.tone == 'down' %}down{% endif %}">
+          {{ "%.0f"|format(mover_spark.latest_pct) }}%
+        </span>
+        {% if mover_spark.delta_pct is not none %}
+        <span class="weight">({{ "%+.0f"|format(mover_spark.delta_pct) }} pp)</span>
+        {% endif %}
+        · {{ mover_spark.first_day }} → {{ mover_spark.last_day }}
+      </figcaption>
+    </figure>
+    {% endif %}
+    {% if near_spark.ready %}
+    <figure class="breadth-ad-spark" id="breadth-near-high-spark">
+      {{ near_spark.svg|safe }}
+      <figcaption>
+        Near-high ratio (% of stock breakouts) · {{ near_spark.n }} days ·
+        latest
+        <span class="v {% if near_spark.tone == 'up' %}up{% elif near_spark.tone == 'down' %}down{% endif %}">
+          {{ "%.0f"|format(near_spark.latest_pct) }}%
+        </span>
+        {% if near_spark.delta_pct is not none %}
+        <span class="weight">({{ "%+.0f"|format(near_spark.delta_pct) }} pp)</span>
+        {% endif %}
+        · {{ near_spark.first_day }} → {{ near_spark.last_day }}
+      </figcaption>
+    </figure>
+    {% endif %}
+    {% if adv_spark.ready %}
+    <figure class="breadth-ad-spark" id="breadth-stock-advance-spark">
+      {{ adv_spark.svg|safe }}
+      <figcaption>
+        Stock advance % (priced up / n) · {{ adv_spark.n }} days ·
+        latest
+        <span class="v {% if adv_spark.tone == 'up' %}up{% elif adv_spark.tone == 'down' %}down{% endif %}">
+          {{ "%.0f"|format(adv_spark.latest_pct) }}%
+        </span>
+        {% if adv_spark.delta_pct is not none %}
+        <span class="weight">({{ "%+.0f"|format(adv_spark.delta_pct) }} pp)</span>
+        {% endif %}
+        · {{ adv_spark.first_day }} → {{ adv_spark.last_day }}
+      </figcaption>
+    </figure>
+    {% endif %}
+    {% if crypto_adv_spark.ready %}
+    <figure class="breadth-ad-spark" id="breadth-crypto-advance-spark">
+      {{ crypto_adv_spark.svg|safe }}
+      <figcaption>
+        Crypto advance % (leaders up / n) · {{ crypto_adv_spark.n }} days ·
+        latest
+        <span class="v {% if crypto_adv_spark.tone == 'up' %}up{% elif crypto_adv_spark.tone == 'down' %}down{% endif %}">
+          {{ "%.0f"|format(crypto_adv_spark.latest_pct) }}%
+        </span>
+        {% if crypto_adv_spark.delta_pct is not none %}
+        <span class="weight">({{ "%+.0f"|format(crypto_adv_spark.delta_pct) }} pp)</span>
+        {% endif %}
+        · {{ crypto_adv_spark.first_day }} → {{ crypto_adv_spark.last_day }}
+      </figcaption>
+    </figure>
+    {% endif %}
+  </div>
+  {% endif %}
+  <div class="breadth-days-wrap">
+    <table class="breadth-days-table" aria-label="Scan pulse history">
+      <thead>
+        <tr>
+          <th scope="col">Day (UTC)</th>
+          <th scope="col" title="Crypto leaders up / down and advance % of leaders">A/D</th>
+          <th scope="col" title="Mean 24h % change across those crypto leaders">avg</th>
+          <th scope="col" title="How many leaders moved at least 4% (up or down), and % of leaders">±4%</th>
+          <th scope="col" title="Stock breakouts within 5% of their 52-week high, and % of breakouts">near-high</th>
+          <th scope="col" title="Both ±4% and near-high ratios ≥25%; confirmed = also risk-on (StockBee-lite; display only)">thrust</th>
+          <th scope="col" title="Stock + crypto advance: risk-on (≥50%/≥50%), split (≥60%/≤40%), risk-off (both ≤40%), or mixed mid-range; display only">tape</th>
+          <th scope="col" title="Stock batch priced this cycle: up / down and advance %">stock A/D</th>
+          <th scope="col">Log</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for d in snap.scan_breadth_history|reverse %}
+        <tr{% if d.is_confirmed_thrust %} class="is-confirmed-thrust"{% elif d.is_thrust %} class="is-thrust"{% elif d.is_dual_advance %} class="is-dual-advance"{% elif d.is_tape_split %} class="is-tape-split"{% elif d.is_risk_off %} class="is-risk-off"{% elif d.is_mixed or d.tape_label == "mixed" %} class="is-mixed"{% endif %}>
+          <th scope="row" class="sym">
+            {% if d.has_scan_log and d.scan_log_href %}
+            <a href="{{ d.scan_log_href }}" title="Open scan log for {{ d.day }}">{{ d.day }}</a>
+            {% else %}
+            {{ d.day }}
+            {% endif %}
+            {% if d.meta_bit %}
+            <span class="weight{% if d.meta_tone == 'warn' %} v down{% endif %}" title="Pulse metadata vs UTC day"> · {{ d.meta_bit }}</span>
+            {% endif %}
+          </th>
+          <td>
+            {{ d.crypto_up }}/{{ d.crypto_down }}{% if d.crypto_advance_pct is not none %}
+            <span class="weight">({{ "%.0f"|format(d.crypto_advance_pct) }}%)</span>
+            {% endif %}
+          </td>
+          <td>{% if d.crypto_avg_chg is not none %}{{ "%+.1f"|format(d.crypto_avg_chg) }}%{% else %}<span class="meta" title="No readable 24h % that day">n/a</span>{% endif %}</td>
+          <td>
+            {{ d.crypto_big_movers }}{% if d.crypto_mover_pct is not none %}
+            <span class="weight">({{ "%.0f"|format(d.crypto_mover_pct) }}%)</span>
+            {% endif %}
+          </td>
+          <td>
+            {{ d.stock_within_5pct_high }}{% if d.near_high_pct is not none %}
+            <span class="weight">({{ "%.0f"|format(d.near_high_pct) }}%)</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if d.is_confirmed_thrust %}
+            <span class="v up">confirmed</span>
+            {% elif d.is_thrust %}
+            <span class="v">alone</span>
+            {% else %}
+            <span class="weight">—</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if d.tape_label == "risk-on" %}
+            <span class="v up">risk-on</span>
+            {% elif d.tape_label == "split" %}
+            <span class="v down">split</span>
+            {% elif d.tape_label == "risk-off" %}
+            <span class="v down">risk-off</span>
+            {% elif d.tape_label == "mixed" %}
+            <span class="v">mixed</span>
+            {% else %}
+            <span class="weight">—</span>
+            {% endif %}
+            {% if d.tape_flip and d.prev_tape_label %}
+            <span class="weight" title="Tape flipped from prior UTC day"> · ←{{ d.prev_tape_label }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if d.stock_scan_n is defined and d.stock_scan_n %}
+            {{ d.stock_scan_up|default(0) }}/{{ d.stock_scan_down|default(0) }}{% if d.stock_advance_pct is not none %}
+            <span class="weight">({{ "%.0f"|format(d.stock_advance_pct) }}%)</span>
+            {% endif %}
+            {% else %}
+            —
+            {% endif %}
+          </td>
+          <td>
+            {% if d.has_scan_log and d.scan_log_href %}
+            <a class="day-log" href="{{ d.scan_log_href }}">scan log</a>
+            {% else %}
+            —
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <p class="pulse-key-note" id="pulse-key">
+      <span class="k">A/D</span> crypto leaders up/down · advance % of leaders ·
+      <span class="k">avg</span> mean 24h % ·
+      <span class="k">±4%</span> |move| ≥ 4% · share of crypto leaders ·
+      <span class="k">near-high</span> stocks ≤5% from 52w high ·
+      <span class="k">thrust</span> confirmed = risk-on · alone = without dual advance ·
+      <span class="k">tape</span> risk-on (both adv ≥50%) · split (60/40) · risk-off (both ≤40%) ·
+      <span class="k">stock A/D</span> priced batch up/down · advance % of priced ·
+      <span class="k">meta</span> scan_time must cover the day · empty = 0 priced
+    </p>
+  </div>
+  {% endif %}
+</section>
+
+<section class="block" aria-labelledby="sess-h">
+  <h2 id="sess-h">Session</h2>
+  <p class="mode">{{ snap.weekend_hint }}</p>
+  <p class="sysline">Marks: {{ snap.mark_note }}</p>
+  {{ ledger_health_glance(
+    snap,
+    "breadth-ledger-h",
+    "/desk/book",
+    "Book ledger →",
+    "Ledger parse check beside session marks. A bad line no longer hides fills. Not a gate."
+  ) }}
+  <p class="sysline">Commission {{ "%.2f"|format(snap.commission_rate_pct) }}% / side · equity €{{ "{:,.2f}".format(snap.equity) }} ({{ "%+.2f"|format(snap.ret_pct) }}%)</p>
+</section>
+
+<section class="block" aria-labelledby="cov-h">
+  <h2 id="cov-h">Scan coverage</h2>
+  <dl class="facts">
+    <div>
+      <dt>Tracked symbols</dt>
+      <dd>{{ snap.scanned_symbols }}</dd>
+    </div>
+    <div>
+      <dt>History names</dt>
+      <dd>{{ snap.scan_history_symbols }}</dd>
+    </div>
+    <div>
+      <dt>Last full cycle</dt>
+      <dd>{{ snap.last_full_cycle or "—" }}</dd>
+    </div>
+    <div>
+      <dt>Latest scan</dt>
+      <dd>{% if snap.scan_freshness and snap.scan_freshness.ready %}{{ snap.scan_freshness.line }}{% else %}{{ snap.scan_time or "—" }}{% endif %}</dd>
+    </div>
+  </dl>
+</section>
+{% endblock %}

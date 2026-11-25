@@ -1,0 +1,905 @@
+"""Opportunity archive latest-pin honesty (xang1234 #682 readiness)."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from openbb_backend.desk import (
+    archive_pin_lean_meta,
+    build_scan_freshness,
+    resolve_opportunities_archive,
+)
+from stock_checker.opportunity_archive import (
+    heal_opportunities_latest_pin,
+    opportunity_damaged_vs_ok_delta,
+    opportunity_damaged_vs_ok_delta_lead,
+    opportunity_damaged_vs_ok_delta_lead_size,
+    opportunity_damaged_vs_ok_lead,
+    opportunity_damaged_vs_ok_lean,
+    opportunity_damaged_vs_ok_sample_gap,
+)
+
+
+def test_resolve_prefers_latest_symlink(tmp_path: Path) -> None:
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    target = arch / "opportunities_20260101_120000.json"
+    target.write_text("{}")
+    (arch / "opportunities_latest.json").symlink_to(target.name)
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "latest"
+    assert res["fallback"] is False
+    assert res["warn"] is False
+    assert res["bit"] == ""
+    assert Path(res["path"]).resolve() == target.resolve()
+
+
+def test_resolve_falls_back_when_latest_missing(tmp_path: Path) -> None:
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    older = arch / "opportunities_20260101_120000.json"
+    older.write_text("{}")
+    newer = arch / "opportunities_20260201_120000.json"
+    newer.write_text('{"n": 1}')
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "missing"
+    assert res["fallback"] is True
+    assert res["healed"] is True
+    assert res["warn"] is True
+    assert res["bit"] == "latest missing · healed"
+    assert Path(res["path"]) == newer
+    # Desk heal retargets so hard-readers match keep-newest next open.
+    assert (arch / "opportunities_latest.json").resolve() == newer.resolve()
+    again = resolve_opportunities_archive(tmp_path)
+    assert again["pin"] == "latest"
+    assert again["fallback"] is False
+    assert again["healed"] is False
+    assert again["bit"] == ""
+
+
+def test_resolve_falls_back_when_latest_dangling(tmp_path: Path) -> None:
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    (arch / "opportunities_latest.json").symlink_to("opportunities_gone.json")
+    kept = arch / "opportunities_20260301_000000.json"
+    kept.write_text("{}")
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "dangling"
+    assert res["fallback"] is True
+    assert res["healed"] is True
+    assert res["warn"] is True
+    assert res["bit"] == "latest dangling · healed"
+    assert Path(res["path"]) == kept
+    assert (arch / "opportunities_latest.json").resolve() == kept.resolve()
+
+
+def test_resolve_falls_back_when_latest_stale(tmp_path: Path) -> None:
+    """Live latest behind a newer timestamped publish → keep-newest (#685)."""
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    pinned = arch / "opportunities_20260101_120000.json"
+    pinned.write_text('{"old": true}')
+    newer = arch / "opportunities_20260201_120000.json"
+    newer.write_text('{"new": true}')
+    (arch / "opportunities_latest.json").symlink_to(pinned.name)
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "stale"
+    assert res["fallback"] is True
+    assert res["healed"] is True
+    assert res["warn"] is True
+    assert res["behind"] == 1
+    assert res["behind_share_pct"] == 50
+    assert res["behind_share_severity"] == "hot"
+    assert res["pin_side"] == 1
+    assert res["pin_share_pct"] == 50
+    assert res["pin_share_severity"] == ""
+    # 50/50: behind hot · pin mid → clash (Screener junk vs ok lean parity).
+    assert res["behind_vs_pin"] == "clash · behind hot · pin ok"
+    assert res["behind_vs_pin_warn"] is True
+    assert res["behind_vs_pin_delta_pp"] == 0
+    assert res["behind_vs_pin_delta_severity"] == "thin"
+    assert res["behind_vs_pin_lean_vs_delta"] == "align · thin"
+    assert res["behind_vs_pin_lean_vs_delta_warn"] is False
+    assert res["pin_lag_label"] == "lag 31d · stale"
+    assert res["pin_lag_severity"] == "stale"
+    assert res["pin_lag_sec"] == 31 * 86400
+    # stale↔hot crossed (soft-allow last/share extremes).
+    assert res["pin_lag_vs_share"] == "clash · stale · hot"
+    assert res["pin_lag_vs_share_warn"] is True
+    # lag/share clash + lean clash → both-clash (Screener lean vs Δ moods).
+    assert res["pin_lag_share_vs_lean"] == "align · both clash"
+    assert res["pin_lag_share_vs_lean_warn"] is True
+    # both-clash meta-align vs lean↔Δ align → calm both-align (verbs match).
+    assert res["pin_lag_share_lean_vs_delta"] == "align · both align"
+    assert res["pin_lag_share_lean_vs_delta_warn"] is False
+    assert res["bit"] == (
+        "latest stale · 1 behind · hot · 50% · vs 1 pin · 50% · "
+        "behind vs pin clash · behind hot · pin ok · Δ thin · 0pp · "
+        "lean vs Δ align · thin · lag 31d · stale · "
+        "lag/share clash · stale · hot · "
+        "lag/share vs lean align · both clash · "
+        "lag/share↔lean vs lean↔Δ align · both align · healed"
+    )
+    assert res["bit_core"] == (
+        "latest stale · 1 behind · hot · 50% · vs 1 pin · 50% · "
+        "lag 31d · stale · healed"
+    )
+    assert res["pin_lean"] == (
+        "behind vs pin clash · behind hot · pin ok · Δ thin · 0pp · "
+        "lean vs Δ align · thin · lag/share clash · stale · hot · "
+        "lag/share vs lean align · both clash · "
+        "lag/share↔lean vs lean↔Δ align · both align"
+    )
+    assert res["pin_lean_warn"] is True
+    assert Path(res["path"]) == newer
+    assert (arch / "opportunities_latest.json").resolve() == newer.resolve()
+
+
+def test_resolve_stale_speaks_behind_count(tmp_path: Path) -> None:
+    """Bare stale hid how many publishes sit ahead (portfolio AI count≠share)."""
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    pinned = arch / "opportunities_20260101_120000.json"
+    pinned.write_text('{"old": true}')
+    mid = arch / "opportunities_20260115_120000.json"
+    mid.write_text('{"mid": true}')
+    newest = arch / "opportunities_20260201_120000.json"
+    newest.write_text('{"new": true}')
+    (arch / "opportunities_latest.json").symlink_to(pinned.name)
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "stale"
+    assert res["behind"] == 2
+    assert res["behind_share_pct"] == 67
+    assert res["behind_share_severity"] == "hot"
+    assert res["pin_side"] == 1
+    assert res["pin_share_pct"] == 33
+    assert res["pin_share_severity"] == "thin"
+    assert res["behind_vs_pin"] == "align · hot|thin"
+    assert res["behind_vs_pin_warn"] is False
+    assert res["behind_vs_pin_delta_pp"] == 34
+    assert res["behind_vs_pin_delta_severity"] == "wide"
+    assert res["behind_vs_pin_lean_vs_delta"] == "align · wide"
+    # Adverse align · hot|thin + Δ wide (Screener junk vs ok lean/Δ).
+    assert res["behind_vs_pin_lean_vs_delta_warn"] is True
+    assert res["pin_lag_label"] == "lag 31d · stale"
+    assert res["pin_lag_severity"] == "stale"
+    assert res["pin_lag_vs_share"] == "clash · stale · hot"
+    assert res["pin_lag_vs_share_warn"] is True
+    # lag/share clash vs lean align → crossed warn.
+    assert res["pin_lag_share_vs_lean"] == (
+        "clash · lag/share clash · lean align"
+    )
+    assert res["pin_lag_share_vs_lean_warn"] is True
+    # meta-clash vs lean↔Δ align → crossed warn.
+    assert res["pin_lag_share_lean_vs_delta"] == (
+        "clash · lag/share↔lean clash · lean↔Δ align"
+    )
+    assert res["pin_lag_share_lean_vs_delta_warn"] is True
+    assert res["bit"] == (
+        "latest stale · 2 behind · hot · 67% · vs 1 pin · thin · 33% · "
+        "behind vs pin align · hot|thin · Δ wide · +34pp · "
+        "lean vs Δ align · wide · lag 31d · stale · "
+        "lag/share clash · stale · hot · "
+        "lag/share vs lean clash · lag/share clash · lean align · "
+        "lag/share↔lean vs lean↔Δ clash · lag/share↔lean clash · "
+        "lean↔Δ align · healed"
+    )
+    assert res["bit_core"] == (
+        "latest stale · 2 behind · hot · 67% · vs 1 pin · thin · 33% · "
+        "lag 31d · stale · healed"
+    )
+    assert res["pin_lean"] == (
+        "behind vs pin align · hot|thin · Δ wide · +34pp · "
+        "lean vs Δ align · wide · lag/share clash · stale · hot · "
+        "lag/share vs lean clash · lag/share clash · lean align · "
+        "lag/share↔lean vs lean↔Δ clash · lag/share↔lean clash · "
+        "lean↔Δ align"
+    )
+    assert res["pin_lean_warn"] is True
+    assert Path(res["path"]) == newest
+
+
+def test_resolve_stale_behind_share_quiet(tmp_path: Path) -> None:
+    """Absolute N behind alone hid a sliver lag vs a majority miss."""
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    # 4 older + pin + 1 newer → behind=1 of 6 → 17% quiet · vs 5 pin strong
+    for i, name in enumerate(
+        (
+            "opportunities_20260101_120000.json",
+            "opportunities_20260102_120000.json",
+            "opportunities_20260103_120000.json",
+            "opportunities_20260104_120000.json",
+            "opportunities_20260105_120000.json",
+            "opportunities_20260106_120000.json",
+        )
+    ):
+        (arch / name).write_text(f'{{"i": {i}}}')
+    (arch / "opportunities_latest.json").symlink_to(
+        "opportunities_20260105_120000.json"
+    )
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "stale"
+    assert res["behind"] == 1
+    assert res["behind_share_pct"] == 17
+    assert res["behind_share_severity"] == "quiet"
+    assert res["pin_side"] == 5
+    assert res["pin_share_pct"] == 83
+    assert res["pin_share_severity"] == "strong"
+    assert res["behind_vs_pin"] == "align · quiet|strong"
+    assert res["behind_vs_pin_warn"] is False
+    assert res["behind_vs_pin_delta_pp"] == -66
+    assert res["behind_vs_pin_delta_severity"] == "wide"
+    assert res["behind_vs_pin_lean_vs_delta"] == "align · wide"
+    # Favorable quiet|strong stays calm on lean vs Δ even when Δ is wide.
+    assert res["behind_vs_pin_lean_vs_delta_warn"] is False
+    assert res["pin_lag_label"] == "lag 24h · aging"
+    assert res["pin_lag_severity"] == "aging"
+    # aging lag stays silent on lag/share (extremes only) → vs lean silent
+    # → meta vs lean↔Δ silent (missing lag/share↔lean).
+    assert res["pin_lag_vs_share"] == ""
+    assert res["pin_lag_vs_share_warn"] is False
+    assert res["pin_lag_share_vs_lean"] == ""
+    assert res["pin_lag_share_vs_lean_warn"] is False
+    assert res["pin_lag_share_lean_vs_delta"] == ""
+    assert res["pin_lag_share_lean_vs_delta_warn"] is False
+    assert res["bit"] == (
+        "latest stale · 1 behind · quiet · 17% · "
+        "vs 5 pin · strong · 83% · behind vs pin align · quiet|strong · "
+        "Δ wide · -66pp · lean vs Δ align · wide · lag 24h · aging · healed"
+    )
+    assert res["bit_core"] == (
+        "latest stale · 1 behind · quiet · 17% · "
+        "vs 5 pin · strong · 83% · lag 24h · aging · healed"
+    )
+    assert res["pin_lean"] == (
+        "behind vs pin align · quiet|strong · Δ wide · -66pp · "
+        "lean vs Δ align · wide"
+    )
+    assert res["pin_lean_warn"] is False
+    assert Path(res["path"]).name == "opportunities_20260106_120000.json"
+
+
+def test_resolve_stale_speaks_pin_lag_hours(tmp_path: Path) -> None:
+    """Count+% alone hid whether the pin is hours or weeks behind newest."""
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    pinned = arch / "opportunities_20260101_100000.json"
+    pinned.write_text('{"old": true}')
+    newer = arch / "opportunities_20260101_160000.json"
+    newer.write_text('{"new": true}')
+    (arch / "opportunities_latest.json").symlink_to(pinned.name)
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "stale"
+    assert res["behind"] == 1
+    assert res["behind_vs_pin"] == "clash · behind hot · pin ok"
+    assert res["behind_vs_pin_delta_pp"] == 0
+    assert res["behind_vs_pin_delta_severity"] == "thin"
+    assert res["behind_vs_pin_lean_vs_delta"] == "align · thin"
+    assert res["pin_lag_label"] == "lag 6h · aging"
+    assert res["pin_lag_severity"] == "aging"
+    assert res["pin_lag_sec"] == 6 * 3600
+    assert res["pin_lag_vs_share"] == ""
+    assert res["pin_lag_vs_share_warn"] is False
+    assert res["pin_lag_share_vs_lean"] == ""
+    assert res["pin_lag_share_vs_lean_warn"] is False
+    assert res["pin_lag_share_lean_vs_delta"] == ""
+    assert res["pin_lag_share_lean_vs_delta_warn"] is False
+    assert res["bit"] == (
+        "latest stale · 1 behind · hot · 50% · vs 1 pin · 50% · "
+        "behind vs pin clash · behind hot · pin ok · Δ thin · 0pp · "
+        "lean vs Δ align · thin · lag 6h · aging · healed"
+    )
+    assert Path(res["path"]) == newer
+
+
+def test_resolve_stale_speaks_pin_lag_fresh(tmp_path: Path) -> None:
+    """Bare lag duration hid same-session race vs multi-day miss (FinRobot)."""
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    pinned = arch / "opportunities_20260101_120000.json"
+    pinned.write_text('{"old": true}')
+    newer = arch / "opportunities_20260101_130000.json"
+    newer.write_text('{"new": true}')
+    (arch / "opportunities_latest.json").symlink_to(pinned.name)
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "stale"
+    assert res["pin_lag_sec"] == 3600
+    assert res["pin_lag_severity"] == "fresh"
+    assert res["pin_lag_label"] == "lag 1h · fresh"
+    # fresh↔hot align (soft-allow last/share + FinRobot age).
+    assert res["pin_lag_vs_share"] == "align · fresh · hot"
+    assert res["pin_lag_vs_share_warn"] is False
+    # lag/share align vs lean clash → crossed warn.
+    assert res["pin_lag_share_vs_lean"] == (
+        "clash · lag/share align · lean clash"
+    )
+    assert res["pin_lag_share_vs_lean_warn"] is True
+    # meta-clash vs lean↔Δ align → crossed warn.
+    assert res["pin_lag_share_lean_vs_delta"] == (
+        "clash · lag/share↔lean clash · lean↔Δ align"
+    )
+    assert res["pin_lag_share_lean_vs_delta_warn"] is True
+    assert (
+        "lag 1h · fresh · lag/share align · fresh · hot · "
+        "lag/share vs lean clash · lag/share align · lean clash · "
+        "lag/share↔lean vs lean↔Δ clash · lag/share↔lean clash · "
+        "lean↔Δ align · healed"
+    ) in res["bit"]
+
+
+def test_resolve_missing_archive_speaks_pin() -> None:
+    res = resolve_opportunities_archive("/tmp/asc-no-such-desk-data")
+    assert res["pin"] == "missing"
+    assert res["warn"] is True
+    assert res["bit"] == "latest missing"
+    assert res["fallback"] is False
+
+
+def test_scan_freshness_speaks_archive_pin_bit() -> None:
+    now = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+    when = (now - timedelta(minutes=10)).isoformat()
+    g = build_scan_freshness(
+        when,
+        now=now,
+        archive_pin="missing",
+        archive_pin_bit="latest missing · healed",
+        archive_pin_warn=True,
+    )
+    assert g["ready"] is True
+    assert g["archive_pin"] == "missing"
+    assert g["archive_pin_bit"] == "latest missing · healed"
+    assert g["archive_pin_warn"] is True
+    assert "latest missing · healed" in g["line"]
+    # Age band on the line stays fresh; display tone escalates for CSS.
+    assert " · fresh · " in g["line"]
+    assert g["tone"] == "aging"
+
+
+def test_scan_freshness_pin_only_when_no_scan_time() -> None:
+    g = build_scan_freshness(
+        None,
+        archive_pin="dangling",
+        archive_pin_bit="latest dangling",
+        archive_pin_warn=True,
+    )
+    assert g["ready"] is True
+    assert g["tone"] == "stale"
+    assert g["line"] == "latest dangling"
+
+
+def test_scan_freshness_speaks_stale_pin_bit() -> None:
+    now = datetime(2026, 10, 25, 12, 0, tzinfo=timezone.utc)
+    when = (now - timedelta(minutes=10)).isoformat()
+    full_bit = (
+        "latest stale · 2 behind · hot · 67% · "
+        "vs 1 pin · thin · 33% · behind vs pin align · hot|thin · "
+        "Δ wide · +34pp · lean vs Δ align · wide · lag 31d · stale · healed"
+    )
+    bit_core = (
+        "latest stale · 2 behind · hot · 67% · "
+        "vs 1 pin · thin · 33% · lag 31d · stale · healed"
+    )
+    pin_lean = (
+        "behind vs pin align · hot|thin · Δ wide · +34pp · "
+        "lean vs Δ align · wide"
+    )
+    g = build_scan_freshness(
+        when,
+        now=now,
+        archive_pin="stale",
+        archive_pin_bit=full_bit,
+        archive_pin_bit_core=bit_core,
+        archive_pin_lean=pin_lean,
+        archive_pin_lean_warn=True,
+        archive_pin_warn=True,
+    )
+    assert full_bit in g["line"]
+    assert " · fresh · " in g["line"]
+    assert g["tone"] == "aging"
+    assert g["archive_pin"] == "stale"
+    assert g["archive_pin_bit_core"] == bit_core
+    assert g["archive_pin_lean"] == pin_lean
+    assert g["archive_pin_lean_warn"] is True
+    # Bare warn hid which ladder stages spoke (Screener weight lean meta).
+    assert g["archive_pin_lean_meta"] == "warn · behind · Δ · lean"
+
+
+def test_archive_pin_lean_meta_names_spoken_stages() -> None:
+    """Quiet/warn chip names pin-lean stages (not a static cascade)."""
+    assert archive_pin_lean_meta("") == "quiet"
+    quiet = (
+        "damaged vs ok align · quiet|strong · Δ wide · -60pp · "
+        "lean vs Δ align · wide · Δ lead · ok · "
+        "Δ lead size · 4× · "
+        "Δ lead size sides · ok 80% · damaged 20%"
+    )
+    assert archive_pin_lean_meta(quiet) == (
+        "quiet · 6 folds · damaged · Δ · lean · lead · +2"
+    )
+    behind = (
+        "behind vs pin align · hot|thin · Δ wide · +34pp · "
+        "lean vs Δ align · wide · lag/share align · both thin"
+    )
+    assert archive_pin_lean_meta(behind) == (
+        "quiet · 4 folds · behind · Δ · lean · lag/share"
+    )
+    clash = (
+        "damaged vs ok clash · damaged hot · ok ok · Δ thin · 0pp · "
+        "lean vs Δ align · thin"
+    )
+    assert archive_pin_lean_meta(clash, warn=True) == (
+        "clash · damaged · Δ · lean"
+    )
+    assert archive_pin_lean_meta(behind, warn=True) == (
+        "warn · behind · Δ · lean · lag/share"
+    )
+
+
+def test_opportunities_markdown_prefers_latest(tmp_path: Path) -> None:
+    from openbb_backend.main import _opportunities_markdown_body
+
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    target = arch / "opportunities_20260101_120000.json"
+    target.write_text(
+        '{"recommendations":[{"symbol":"AAPL","asset_class":"stock",'
+        '"score":40,"reasoning":"ok"}]}'
+    )
+    (arch / "opportunities_latest.json").symlink_to(target.name)
+
+    body = _opportunities_markdown_body(tmp_path)
+    assert "AAPL" in body
+    assert "Archive pin" not in body
+
+
+def test_opportunities_markdown_falls_back_when_latest_stale(tmp_path: Path) -> None:
+    """Widget hard-read of opportunities_latest hid keep-newest (#682/#685)."""
+    from openbb_backend.main import _opportunities_markdown_body
+
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    pinned = arch / "opportunities_20260101_120000.json"
+    pinned.write_text(
+        '{"recommendations":[{"symbol":"OLD","asset_class":"stock",'
+        '"score":1,"reasoning":"stale pin"}]}'
+    )
+    newer = arch / "opportunities_20260201_120000.json"
+    newer.write_text(
+        '{"recommendations":[{"symbol":"NEW","asset_class":"stock",'
+        '"score":99,"reasoning":"keep newest"}]}'
+    )
+    (arch / "opportunities_latest.json").symlink_to(pinned.name)
+
+    body = _opportunities_markdown_body(tmp_path)
+    assert "NEW" in body
+    assert "OLD" not in body
+    assert (
+        "latest stale · 1 behind · hot · 50% · vs 1 pin · 50% · "
+        "behind vs pin clash · behind hot · pin ok · Δ thin · 0pp · "
+        "lean vs Δ align · thin · lag 31d · stale · "
+        "lag/share clash · stale · hot · "
+        "lag/share vs lean align · both clash · "
+        "lag/share↔lean vs lean↔Δ align · both align · healed"
+    ) in body
+
+
+def test_opportunities_markdown_prefers_txt_twin_of_resolved(tmp_path: Path) -> None:
+    from openbb_backend.main import _opportunities_markdown_body
+
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    newer = arch / "opportunities_20260201_120000.json"
+    newer.write_text('{"recommendations":[]}')
+    (arch / "opportunities_20260201_120000.txt").write_text("# From twin txt\nKEEP")
+    pinned = arch / "opportunities_20260101_120000.json"
+    pinned.write_text("{}")
+    (arch / "opportunities_latest.json").symlink_to(pinned.name)
+    (arch / "opportunities_latest.txt").write_text("# Stale twin\nOLD")
+
+    body = _opportunities_markdown_body(tmp_path)
+    assert "KEEP" in body
+    assert "OLD" not in body
+    assert (
+        "latest stale · 1 behind · hot · 50% · vs 1 pin · 50% · "
+        "behind vs pin clash · behind hot · pin ok · Δ thin · 0pp · "
+        "lean vs Δ align · thin · lag 31d · stale · "
+        "lag/share clash · stale · hot · "
+        "lag/share vs lean align · both clash · "
+        "lag/share↔lean vs lean↔Δ align · both align · healed"
+    ) in body
+
+
+def test_heal_skips_malformed_newest_publish(tmp_path: Path) -> None:
+    """xang1234 8d447fa: refuse malformed session — pin usable older only."""
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    good = arch / "opportunities_20260101_120000.json"
+    good.write_text('{"ok": true}')
+    good_txt = arch / "opportunities_20260101_120000.txt"
+    good_txt.write_text("good")
+    junk = arch / "opportunities_20260201_120000.json"
+    junk.write_text("{not-json")
+    (arch / "opportunities_20260201_120000.txt").write_text("junk")
+    (arch / "opportunities_latest.json").symlink_to(good.name)
+    (arch / "opportunities_latest.txt").symlink_to(good_txt.name)
+
+    assert heal_opportunities_latest_pin(arch) is False
+    assert (arch / "opportunities_latest.json").resolve() == good.resolve()
+    assert (arch / "opportunities_latest.txt").resolve() == good_txt.resolve()
+
+
+def test_resolve_heals_damaged_latest_pin(tmp_path: Path) -> None:
+    """Damaged pin target → speak damaged + heal to newest usable object."""
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    good = arch / "opportunities_20260101_120000.json"
+    good.write_text('{"ok": true}')
+    junk = arch / "opportunities_20260201_120000.json"
+    junk.write_text("[]")  # wrong container ≠ usable book
+    (arch / "opportunities_latest.json").symlink_to(junk.name)
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "damaged"
+    assert res["fallback"] is True
+    assert res["healed"] is True
+    assert res["warn"] is True
+    assert res["bit"] == "latest damaged · healed"
+    assert Path(res["path"]).resolve() == good.resolve()
+    assert (arch / "opportunities_latest.json").resolve() == good.resolve()
+
+
+def test_resolve_ignores_malformed_newer_for_stale(tmp_path: Path) -> None:
+    """Valid pin is not stale when only newer publishes are damaged.
+
+    Still speaks skipped junk — silent usable-filter ≠ clean archive
+    (xang1234 40a968e + Screener junk share).
+    """
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    pinned = arch / "opportunities_20260101_120000.json"
+    pinned.write_text('{"pin": true}')
+    (arch / "opportunities_20260201_120000.json").write_text("{truncated")
+    (arch / "opportunities_latest.json").symlink_to(pinned.name)
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "latest"
+    assert res["fallback"] is False
+    assert res["warn"] is True
+    assert res["damaged"] == 1
+    assert res["damaged_share_pct"] == 50
+    assert res["damaged_share_severity"] == "hot"
+    assert res["ok"] == 1
+    assert res["ok_share_pct"] == 50
+    assert res["ok_share_severity"] == ""
+    assert res["damaged_vs_ok_lead"] == ""
+    assert res["damaged_vs_ok_sample_gap"] == "damaged/ok tied"
+    # 50/50 → damaged hot · ok mid → sole lean clash (Screener junk vs ok).
+    assert res["damaged_vs_ok_lean"] == (
+        "damaged vs ok clash · damaged hot · ok ok"
+    )
+    assert res["damaged_vs_ok_lean_warn"] is True
+    # 50/50 → 0pp thin (abs <10); lean vs Δ align · thin (mid is 10–19pp).
+    assert res["damaged_vs_ok_delta_pp"] == 0
+    assert res["damaged_vs_ok_delta_severity"] == "thin"
+    assert res["damaged_vs_ok_lean_vs_delta"] == "align · thin"
+    assert res["damaged_vs_ok_lean_vs_delta_warn"] is False
+    # 0pp thin → Δ lead silent (signed zero has no owner); size stays silent.
+    assert res["damaged_vs_ok_delta_lead"] == ""
+    assert res["damaged_vs_ok_delta_lead_size"] is None
+    assert res["damaged_vs_ok_delta_lead_size_louder_pct"] is None
+    assert res["damaged_vs_ok_delta_lead_size_quieter_pct"] is None
+    assert res["pin_lean"] == (
+        f"{res['damaged_vs_ok_lean']} · Δ thin · 0pp · lean vs Δ align · thin"
+    )
+    assert res["pin_lean_warn"] is True  # lean clash still warns
+    assert res["bit_core"] == (
+        "1 damaged · hot · 50% · vs 1 ok · 50% · damaged/ok tied"
+    )
+    assert res["bit"] == f"{res['bit_core']} · {res['pin_lean']}"
+    assert Path(res["path"]).resolve() == pinned.resolve()
+
+
+def test_resolve_speaks_damaged_quiet_share(tmp_path: Path) -> None:
+    """Quiet damaged share when junk is a small slice of the archive."""
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    newest_ok = None
+    for stamp in (
+        "20260101_120000",
+        "20260102_120000",
+        "20260103_120000",
+        "20260104_120000",
+    ):
+        newest_ok = arch / f"opportunities_{stamp}.json"
+        newest_ok.write_text('{"ok": true}')
+    assert newest_ok is not None
+    (arch / "opportunities_latest.json").symlink_to(newest_ok.name)
+    # One junk among 5 slots → 20% quiet (not newer than the pin).
+    (arch / "opportunities_20260103_180000.json").write_text("[]")
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "latest"
+    assert res["damaged"] == 1
+    assert res["damaged_share_pct"] == 20
+    assert res["damaged_share_severity"] == "quiet"
+    assert res["ok"] == 4
+    assert res["ok_share_pct"] == 80
+    assert res["ok_share_severity"] == "strong"
+    assert res["damaged_vs_ok_lead"] == "ok"
+    assert res["damaged_vs_ok_lead_pct"] == 80
+    assert res["damaged_vs_ok_sample_gap"] == ""
+    assert res["damaged_vs_ok_lean"] == (
+        "damaged vs ok align · quiet|strong"
+    )
+    assert res["damaged_vs_ok_lean_warn"] is False
+    # 20−80 = −60pp wide; favorable quiet|strong stays calm on Δ warn.
+    assert res["damaged_vs_ok_delta_pp"] == -60
+    assert res["damaged_vs_ok_delta_severity"] == "wide"
+    assert res["damaged_vs_ok_lean_vs_delta"] == "align · wide"
+    assert res["damaged_vs_ok_lean_vs_delta_warn"] is False
+    assert res["damaged_vs_ok_delta_lead"] == "ok"
+    # 80÷20 = 4×; lead name ≠ how many times louder owns quieter.
+    assert res["damaged_vs_ok_delta_lead_size"] == 4.0
+    assert res["damaged_vs_ok_delta_lead_size_louder_pct"] == 80
+    assert res["damaged_vs_ok_delta_lead_size_quieter_pct"] == 20
+    assert res["pin_lean"] == (
+        f"{res['damaged_vs_ok_lean']} · Δ wide · -60pp · "
+        "lean vs Δ align · wide · Δ lead · ok · "
+        "Δ lead size · 4× · "
+        "Δ lead size sides · ok 80% · damaged 20%"
+    )
+    assert res["pin_lean_warn"] is False
+    assert res["bit_core"] == (
+        "1 damaged · quiet · 20% · vs 4 ok · strong · 80% · lead ok · 80%"
+    )
+    assert res["bit"] == f"{res['bit_core']} · {res['pin_lean']}"
+    assert res["warn"] is True
+
+
+def test_resolve_speaks_damaged_vs_ok_thin(tmp_path: Path) -> None:
+    """All-but-one damaged → vs 1 ok · thin + lead damaged (ownership)."""
+    arch = tmp_path / "archive"
+    arch.mkdir()
+    pinned = arch / "opportunities_20260101_120000.json"
+    pinned.write_text('{"pin": true}')
+    (arch / "opportunities_latest.json").symlink_to(pinned.name)
+    for stamp in (
+        "20260102_120000",
+        "20260103_120000",
+        "20260104_120000",
+    ):
+        (arch / f"opportunities_{stamp}.json").write_text("{truncated")
+
+    res = resolve_opportunities_archive(tmp_path)
+    assert res["pin"] == "latest"
+    assert res["damaged"] == 3
+    assert res["damaged_share_pct"] == 75
+    assert res["damaged_share_severity"] == "hot"
+    assert res["ok"] == 1
+    assert res["ok_share_pct"] == 25
+    assert res["ok_share_severity"] == "thin"
+    assert res["damaged_vs_ok_lead"] == "damaged"
+    assert res["damaged_vs_ok_lead_pct"] == 75
+    assert res["damaged_vs_ok_sample_gap"] == ""
+    assert res["damaged_vs_ok_lean"] == (
+        "damaged vs ok align · hot|thin"
+    )
+    assert res["damaged_vs_ok_lean_warn"] is False
+    # 75−25 = +50pp wide; adverse hot|thin + Δ wide warns.
+    assert res["damaged_vs_ok_delta_pp"] == 50
+    assert res["damaged_vs_ok_delta_severity"] == "wide"
+    assert res["damaged_vs_ok_lean_vs_delta"] == "align · wide"
+    assert res["damaged_vs_ok_lean_vs_delta_warn"] is True
+    assert res["damaged_vs_ok_delta_lead"] == "damaged"
+    # 75÷25 = 3×; lead name ≠ magnitude.
+    assert res["damaged_vs_ok_delta_lead_size"] == 3.0
+    assert res["damaged_vs_ok_delta_lead_size_louder_pct"] == 75
+    assert res["damaged_vs_ok_delta_lead_size_quieter_pct"] == 25
+    assert res["pin_lean"] == (
+        f"{res['damaged_vs_ok_lean']} · Δ wide · +50pp · "
+        "lean vs Δ align · wide · Δ lead · damaged · "
+        "Δ lead size · 3× · "
+        "Δ lead size sides · damaged 75% · ok 25%"
+    )
+    assert res["pin_lean_warn"] is True
+    assert res["bit_core"] == (
+        "3 damaged · hot · 75% · vs 1 ok · thin · 25% · lead damaged · 75%"
+    )
+    assert res["bit"] == f"{res['bit_core']} · {res['pin_lean']}"
+    assert res["warn"] is True
+
+
+def test_opportunity_damaged_vs_ok_lead_helpers() -> None:
+    """Lead / tied / sole-side silence for damaged vs ok ownership."""
+    bit, name, pct = opportunity_damaged_vs_ok_lead(3, 1)
+    assert bit == "lead damaged · 75%"
+    assert name == "damaged"
+    assert pct == 75
+    assert opportunity_damaged_vs_ok_sample_gap(3, 1) == ""
+
+    bit, name, pct = opportunity_damaged_vs_ok_lead(1, 4)
+    assert bit == "lead ok · 80%"
+    assert name == "ok"
+    assert pct == 80
+
+    assert opportunity_damaged_vs_ok_lead(1, 1) == ("", "", None)
+    assert opportunity_damaged_vs_ok_sample_gap(1, 1) == "damaged/ok tied"
+    assert opportunity_damaged_vs_ok_lead(2, 0) == ("", "", None)
+    assert opportunity_damaged_vs_ok_sample_gap(2, 0) == ""
+    assert opportunity_damaged_vs_ok_lead(0, 0) == ("", "", None)
+
+
+def test_opportunity_damaged_vs_ok_bool_refuse() -> None:
+    """Bool/gap cannot invent archive leads, ties, Δ pp, or size (True→1)."""
+    lean = "damaged vs ok align · quiet|strong"
+    # int(True)→1 / int(False)→0 would invent lead damaged · 100% or a 1/1 tie.
+    assert opportunity_damaged_vs_ok_lead(True, 2) == ("", "", None)
+    assert opportunity_damaged_vs_ok_lead(3, False) == ("", "", None)
+    assert opportunity_damaged_vs_ok_lead(True, True) == ("", "", None)
+    assert opportunity_damaged_vs_ok_sample_gap(True, True) == ""
+    assert opportunity_damaged_vs_ok_sample_gap(True, 1) == ""
+    # float(True)→1% / float(False)→0% would invent thin Δ / 1× size.
+    assert opportunity_damaged_vs_ok_delta(True, 0, lean_bit=lean) == (
+        None,
+        "",
+        "",
+        False,
+    )
+    assert opportunity_damaged_vs_ok_delta(75, False, lean_bit=lean) == (
+        None,
+        "",
+        "",
+        False,
+    )
+    assert (
+        opportunity_damaged_vs_ok_delta_lead(
+            True, "thin", lean_vs_delta="align · thin"
+        )
+        == ""
+    )
+    assert opportunity_damaged_vs_ok_delta_lead_size(
+        True, 25, delta_lead="damaged"
+    ) == (None, None, None)
+    assert opportunity_damaged_vs_ok_delta_lead_size(
+        75, False, delta_lead="damaged"
+    ) == (None, None, None)
+
+
+def test_opportunity_damaged_vs_ok_lean_helpers() -> None:
+    """Align / clash / mid-silent for damaged vs ok severity lean."""
+    bit, warn = opportunity_damaged_vs_ok_lean("hot", "thin")
+    assert bit == "damaged vs ok align · hot|thin"
+    assert warn is False
+
+    bit, warn = opportunity_damaged_vs_ok_lean("quiet", "strong")
+    assert bit == "damaged vs ok align · quiet|strong"
+    assert warn is False
+
+    bit, warn = opportunity_damaged_vs_ok_lean("hot", "strong")
+    assert bit == "damaged vs ok clash · damaged hot · ok strong"
+    assert warn is True
+
+    bit, warn = opportunity_damaged_vs_ok_lean("hot", "")
+    assert bit == "damaged vs ok clash · damaged hot · ok ok"
+    assert warn is True
+
+    bit, warn = opportunity_damaged_vs_ok_lean("quiet", "")
+    assert bit == "damaged vs ok clash · damaged quiet · ok ok"
+    assert warn is False
+
+    assert opportunity_damaged_vs_ok_lean("", "") == ("", False)
+    assert opportunity_damaged_vs_ok_lean("ok", "ok") == ("", False)
+
+
+def test_opportunity_damaged_vs_ok_delta_helpers() -> None:
+    """Wide / thin / mid + adverse hot|thin warn for damaged vs ok share Δ."""
+    lean_fav = "damaged vs ok align · quiet|strong"
+    pp, sev, lvd, warn = opportunity_damaged_vs_ok_delta(
+        20, 80, lean_bit=lean_fav
+    )
+    assert (pp, sev, lvd, warn) == (-60, "wide", "align · wide", False)
+
+    lean_adv = "damaged vs ok align · hot|thin"
+    pp, sev, lvd, warn = opportunity_damaged_vs_ok_delta(
+        75, 25, lean_bit=lean_adv
+    )
+    assert (pp, sev, lvd, warn) == (50, "wide", "align · wide", True)
+
+    lean_clash = "damaged vs ok clash · damaged hot · ok ok"
+    # 0pp is thin (abs <10), not mid.
+    pp, sev, lvd, warn = opportunity_damaged_vs_ok_delta(
+        50, 50, lean_bit=lean_clash
+    )
+    assert (pp, sev, lvd, warn) == (0, "thin", "align · thin", False)
+
+    # Mid band (10≤abs<20) → lean vs Δ clash · lean · Δ mid.
+    pp, sev, lvd, warn = opportunity_damaged_vs_ok_delta(
+        55, 45, lean_bit=lean_clash
+    )
+    assert (pp, sev, lvd, warn) == (10, "", "clash · lean · Δ mid", True)
+
+    # Thin spread (<10pp) when lean spoke.
+    pp, sev, lvd, warn = opportunity_damaged_vs_ok_delta(
+        52, 48, lean_bit=lean_clash
+    )
+    assert (pp, sev, lvd, warn) == (4, "thin", "align · thin", False)
+
+    # No lean → silent.
+    assert opportunity_damaged_vs_ok_delta(75, 25, lean_bit="") == (
+        None,
+        "",
+        "",
+        False,
+    )
+
+
+def test_opportunity_damaged_vs_ok_delta_lead_helpers() -> None:
+    """Name which side owns a spoken damaged vs ok Δ; mid/0 silent."""
+    assert (
+        opportunity_damaged_vs_ok_delta_lead(
+            50, "wide", lean_vs_delta="align · wide"
+        )
+        == "damaged"
+    )
+    assert (
+        opportunity_damaged_vs_ok_delta_lead(
+            -60, "wide", lean_vs_delta="align · wide"
+        )
+        == "ok"
+    )
+    assert (
+        opportunity_damaged_vs_ok_delta_lead(
+            4, "thin", lean_vs_delta="align · thin"
+        )
+        == "damaged"
+    )
+    # 0pp / mid clash / missing lean-vs-Δ stay silent.
+    assert (
+        opportunity_damaged_vs_ok_delta_lead(
+            0, "thin", lean_vs_delta="align · thin"
+        )
+        == ""
+    )
+    assert (
+        opportunity_damaged_vs_ok_delta_lead(
+            10, "", lean_vs_delta="clash · lean · Δ mid"
+        )
+        == ""
+    )
+    assert opportunity_damaged_vs_ok_delta_lead(50, "wide") == ""
+    assert (
+        opportunity_damaged_vs_ok_delta_lead(
+            None, "wide", lean_vs_delta="align · wide"
+        )
+        == ""
+    )
+
+
+def test_opportunity_damaged_vs_ok_delta_lead_size_helpers() -> None:
+    """Louder÷quieter after Δ lead; missing lead / zero quieter silent."""
+    assert opportunity_damaged_vs_ok_delta_lead_size(
+        75, 25, delta_lead="damaged"
+    ) == (3.0, 75.0, 25.0)
+    assert opportunity_damaged_vs_ok_delta_lead_size(
+        20, 80, delta_lead="ok"
+    ) == (4.0, 80.0, 20.0)
+    # No lead / zero quieter / missing shares → silent.
+    assert opportunity_damaged_vs_ok_delta_lead_size(
+        75, 25, delta_lead=""
+    ) == (None, None, None)
+    assert opportunity_damaged_vs_ok_delta_lead_size(
+        100, 0, delta_lead="damaged"
+    ) == (None, None, None)
+    assert opportunity_damaged_vs_ok_delta_lead_size(
+        None, 25, delta_lead="damaged"
+    ) == (None, None, None)

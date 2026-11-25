@@ -1,0 +1,1395 @@
+{# Shared ticker + long name #}
+{% macro ticker(symbol, name='') -%}
+<span class="sym-block">
+  <span class="sym">{{ symbol }}</span>
+  {%- if name %}
+  <span class="name">{{ name }}</span>
+  {%- endif %}
+</span>
+{%- endmacro %}
+
+{# Scan-list breadth glance (display only). heading_id must be unique per page. #}
+{% macro breadth_glance(snap, heading_id, heading_label, sub) -%}
+{% set glance = snap.breadth_glance if snap.breadth_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="breadth-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">{{ heading_label }}</h2>
+  <p class="breadth-glance-line">
+    <span class="breadth-glance-tone {{ glance.tone }}">Breadth</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="breadth-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="breadth-glance-link" href="/desk/breadth">Full breadth →</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Scan archive age honesty (display only). #}
+{% macro scan_freshness(snap) -%}
+{% set fresh = snap.scan_freshness if snap.scan_freshness is mapping else {} %}
+{% if fresh.ready %}
+{% set pin_core = fresh.archive_pin_bit_core|default(fresh.archive_pin_bit|default('')) %}
+{% set pin_lean = fresh.archive_pin_lean|default('') %}
+{% set pin_lean_warn = fresh.archive_pin_lean_warn|default(false) %}
+<p class="scan-fresh {{ fresh.tone }}" title="{{ fresh.scan_time }}">
+  <span class="scan-fresh-tone">{{ fresh.tone }}</span>
+  <span class="pretrade-sep" aria-hidden="true">·</span>
+  <span class="scan-fresh-body">{{ fresh.age_label or fresh.line }}</span>
+  {# age_label alone hid keep-newest pin — speak core when age already owns the body #}
+  {% if pin_core and fresh.age_label %}
+  <span class="pretrade-sep" aria-hidden="true">·</span>
+  <span class="scan-fresh-pin{% if fresh.archive_pin_warn %} warn{% endif %}">{{ pin_core }}</span>
+  {% endif %}
+  {% if fresh.provenance_bit %}
+  <span class="pretrade-sep" aria-hidden="true">·</span>
+  <span class="scan-fresh-prov{% if fresh.provenance != 'live' %} warn{% endif %}">{{ fresh.provenance_bit }}</span>
+  {% endif %}
+  {% if fresh.scan_vs_cash_clash %}
+  <span class="pretrade-sep" aria-hidden="true">·</span>
+  <span class="scan-fresh-clash warn">{{ fresh.scan_vs_cash_clash }}</span>
+  {% endif %}
+  {% if fresh.scan_time and fresh.age_label %}
+  <span class="pretrade-sep" aria-hidden="true">·</span>
+  <span class="scan-fresh-when">{{ fresh.scan_time }}</span>
+  {% endif %}
+</p>
+{% if pin_lean %}
+<details class="scan-fresh-pin-lean{% if pin_lean_warn %} warn{% endif %}"{% if pin_lean_warn %} open{% endif %}>
+  <summary>pin lean <span class="meta">{{ fresh.archive_pin_lean_meta|default('quiet') }}</span></summary>
+  <p class="scan-fresh-pin-lean-body{% if pin_lean_warn %} warn{% endif %}">{{ pin_lean }}</p>
+</details>
+{% endif %}
+{% endif %}
+{%- endmacro %}
+
+
+{# Pre-trade PASS/WARN/FAIL glance (display only). Overview keeps the full section. #}
+{% macro pretrade_glance(
+  snap,
+  heading_id='pretrade-glance-h',
+  link_href='/desk',
+  link_label='Overview →',
+  sub='Daily-loss FAIL · fee burn / post-SL cooldown WARN. Full checklist + size on Overview.'
+) -%}
+{% set glance = snap.pretrade_glance if snap.pretrade_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="pretrade-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Pre-trade checklist</h2>
+  <p class="pretrade-glance-line">
+    <span class="pretrade-glance-tone {{ glance.tone }}">Pre-trade</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="pretrade-level {{ glance.tone }}">{{ glance.level }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="pretrade-glance-body">{{ glance.notes|join("; ") if glance.notes else glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="pretrade-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Fail-open soft-allow glance (display only). Ops can point at #soft-h. #}
+{% macro soft_allow_glance(
+  snap,
+  heading_id='soft-allow-glance-h',
+  link_href='/desk/ops#soft-h',
+  link_label='Ops memory →',
+  sub='Gate passed with missing data — not a hard block. Generation-clash sleeves and RS-gap lean sit under soft lean. Full list on Ops.'
+) -%}
+{% set glance = snap.soft_allow_glance if snap.soft_allow_glance is mapping else {} %}
+{% if glance.ready %}
+{% set body_line = glance.line_core|default(glance.line|default('')) %}
+{% set soft_lean = glance.soft_lean|default('') %}
+{% set soft_lean_warn = glance.soft_lean_warn|default(false) %}
+{% set soft_lean_meta = glance.soft_lean_meta|default('quiet') %}
+<section class="soft-allow-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Fail-open soft-allows</h2>
+  <p class="soft-allow-glance-line">
+    <span class="soft-allow-glance-tone {{ glance.tone }}">Soft-allow</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="soft-allow-glance-body">{{ body_line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="soft-allow-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  {% if soft_lean %}
+  <details class="soft-allow-lean{% if soft_lean_warn %} warn{% endif %}"{% if soft_lean_warn %} open{% endif %}>
+    <summary>soft lean <span class="meta">{{ soft_lean_meta }}</span></summary>
+    <p class="soft-allow-lean-body{% if soft_lean_warn %} warn{% endif %}">{{ soft_lean }}</p>
+  </details>
+  {% endif %}
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Holding mark vs cost fallback (display only). Book/Overview/Breadth keep mark_note. #}
+{% macro mark_coverage_glance(
+  snap,
+  heading_id='mark-coverage-glance-h',
+  link_href='/desk/book',
+  link_label='Book marks →',
+  sub='Live mark vs cost fallback. Incomplete coverage warns. Cost still fills equity. Not a gate.'
+) -%}
+{% set glance = snap.mark_coverage if snap.mark_coverage is mapping else {} %}
+{% if glance.ready %}
+<section class="mark-coverage-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Price coverage</h2>
+  <p class="mark-coverage-glance-line">
+    <span class="mark-coverage-glance-tone {{ glance.tone }}">Marks</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="mark-coverage-glance-body">{{ glance.line or glance.bit }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="mark-coverage-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Ledger file parse honesty (display only). Bad lines stay named; good rows stay. #}
+{% macro ledger_health_glance(
+  snap,
+  heading_id='ledger-health-h',
+  link_href='/desk/book',
+  link_label='Book ledger →',
+  sub='portfolio.json and trades.jsonl parse check. Bad lines are dropped and named. Good rows stay. Short refuse vs long + ownership lead sit under ledger lean. Not a gate.'
+) -%}
+{% set glance = snap.ledger_health if snap.ledger_health is mapping else {} %}
+{% if glance.ready %}
+{% set ledger_lean = glance.lean|default('') %}
+{% set ledger_lean_warn = glance.lean_warn|default(false) %}
+{% set ledger_lean_meta = glance.lean_meta|default('quiet') %}
+<section class="ledger-health-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Ledger health</h2>
+  <p class="ledger-health-glance-line">
+    <span class="ledger-health-glance-tone {{ glance.tone }}">Ledger</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="ledger-health-glance-body">{{ glance.line or glance.bit }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="ledger-health-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  {% if ledger_lean %}
+  <details class="ledger-short-lean{% if ledger_lean_warn %} warn{% endif %}"{% if ledger_lean_warn %} open{% endif %}>
+    <summary>ledger lean <span class="meta">{{ ledger_lean_meta }}</span></summary>
+    <p class="ledger-short-lean-body{% if ledger_lean_warn %} warn{% endif %}">{{ ledger_lean }}</p>
+  </details>
+  {% endif %}
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Book slots/posture glance (display only). Book keeps the full risk strip. #}
+{% macro book_risk_glance(
+  snap,
+  heading_id='book-risk-glance-h',
+  link_href='/desk/book',
+  link_label='Full book →',
+  sub='Slots and posture before adds — overweight means exits-only. Full strip on Book.'
+) -%}
+{% set glance = snap.book_risk_glance if snap.book_risk_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="book-risk-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Book risk</h2>
+  <p class="book-risk-glance-line">
+    <span class="book-risk-glance-tone">Book</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="risk-posture {{ glance.posture }}">{{ glance.posture }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="book-risk-glance-body{% if glance.concentration_warn %} warn{% endif %}">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="book-risk-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Soft entry-gate on/off (display only). Ops keeps the toggles. #}
+{% macro entry_gates_glance(
+  snap,
+  heading_id='entry-gates-glance-h',
+  link_href='/desk/ops#cfg-h',
+  link_label='Ops knobs →',
+  sub='Regime / RS / breadth / promote filters — display only; flip toggles on Ops.'
+) -%}
+{% set glance = snap.entry_gates_glance if snap.entry_gates_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="entry-gates-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Entry gates</h2>
+  <p class="entry-gates-glance-line">
+    <span class="entry-gates-glance-tone {{ glance.tone }}">Gates</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="entry-gates-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="entry-gates-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Paper-calm promote-unlock progress (display only). Ops keeps full facts. #}
+{% macro calm_streak_glance(
+  snap,
+  heading_id='calm-streak-glance-h',
+  link_href='/desk/ops#calm-h',
+  link_label='Ops calm →',
+  sub='Calm UTC days unlock compose promote default — not live edge. Detail on Ops.'
+) -%}
+{% set glance = snap.calm_streak_glance if snap.calm_streak_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="calm-streak-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Paper calm streak</h2>
+  <p class="calm-streak-glance-line">
+    <span class="calm-streak-glance-tone {{ glance.tone }}">Calm</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="calm-streak-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="calm-streak-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  {% set sleeve_lean = glance.window_a_sleeve_lean|default('') %}
+  {% if sleeve_lean %}
+  {% set sleeve_warn = glance.window_a_sleeve_warn|default(false) %}
+  {% set sleeve_meta = glance.window_a_sleeve_lean_meta|default('quiet') %}
+  <details class="promote-sleeve-lean{% if sleeve_warn %} warn{% endif %}"{% if sleeve_warn %} open{% endif %}>
+    <summary>sleeve lean <span class="meta">{{ sleeve_meta }}</span></summary>
+    <p class="promote-sleeve-lean-body{% if sleeve_warn %} warn{% endif %}">{{ sleeve_lean }}</p>
+  </details>
+  {% endif %}
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Promote A/B window honesty (display only). Ops keeps the promote toggle. #}
+{% macro promote_ab_glance(
+  snap,
+  heading_id='promote-ab-glance-h',
+  link_href='/desk/ops#ops-promote',
+  link_label='Ops promote →',
+  sub='Fee-adjusted Window A/B progress — calm ≠ edge. Do not flip promote mid-window.'
+) -%}
+{% set glance = snap.promote_ab_glance if snap.promote_ab_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="promote-ab-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Promote A/B</h2>
+  <p class="promote-ab-glance-line">
+    <span class="promote-ab-glance-tone {{ glance.tone }}">A/B</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="promote-ab-glance-body">{{ glance.summary_line or glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="promote-ab-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  {% set sleeve_lean = glance.a_sleeve_lean|default('') %}
+  {% if sleeve_lean %}
+  {% set sleeve_warn = glance.a_sleeve_warn|default(false) %}
+  {% set sleeve_meta = glance.a_sleeve_lean_meta|default('quiet') %}
+  <details class="promote-sleeve-lean{% if sleeve_warn %} warn{% endif %}"{% if sleeve_warn %} open{% endif %}>
+    <summary>sleeve lean <span class="meta">{{ sleeve_meta }}</span></summary>
+    <p class="promote-sleeve-lean-body{% if sleeve_warn %} warn{% endif %}">{{ sleeve_lean }}</p>
+  </details>
+  {% endif %}
+  {% if glance.honesty_line %}
+  {% set warns = glance.honesty_warns if glance.honesty_warns else [] %}
+  <details class="promote-honesty" id="promote-honesty"{% if warns %} open{% endif %}>
+    <summary>Close honesty <span class="meta">{% if warns %}<span class="warn">warn</span> · {{ warns|length }} hot{% if glance.honesty_fold_count %} of {{ glance.honesty_fold_count }}{% endif %} · {{ glance.honesty_warn_named | join(' · ') }}{% if glance.honesty_quiet_folds %} · quiet · {{ glance.honesty_quiet_fold_count }} {% if glance.honesty_quiet_fold_count == 1 %}fold{% else %}folds{% endif %} · {{ glance.honesty_quiet_named | join(' · ') }}{% elif glance.honesty_fold_count %} · quiet · 0 folds{% endif %}{% elif glance.honesty_folds %}quiet · {{ glance.honesty_fold_count }} {% if glance.honesty_fold_count == 1 %}fold{% else %}folds{% endif %} · {{ glance.honesty_fold_named | join(' · ') }}{% elif glance.honesty_fold_count %}quiet · {{ glance.honesty_fold_count }} {% if glance.honesty_fold_count == 1 %}fold{% else %}folds{% endif %}{% else %}quiet{% endif %}</span></summary>
+    <p class="sub">Warn only. The short line above is the Window A decision. Not a gate.</p>
+    {% if glance.honesty_core %}
+    <p class="weight">{{ glance.honesty_core }}</p>
+    {% elif not glance.fees_line and not glance.polarity_line and not glance.fee_pressure_line and not glance.align_nest_line and not glance.align_deep_line and not glance.exit_euro_line and not glance.exit_mix_line and not glance.kelly_line and not glance.streak_line and not glance.edge_line %}
+    <p class="weight">{{ glance.honesty_line }}</p>
+    {% endif %}
+    {% set fold_meta = glance.honesty_fold_meta if glance.honesty_fold_meta is mapping else {} %}
+    {% if glance.fees_line %}
+    <details class="promote-honesty promote-fees{% if 'fees' in warns %} warn{% endif %}"{% if 'fees' in warns %} open{% endif %}>
+      <summary>Fees <span class="meta">{{ fold_meta.fees|default('quiet') }}</span></summary>
+      <p class="sub">Window fees versus realized. Warn only. Not a gate.</p>
+      <p class="weight">{{ glance.fees_line }}</p>
+    </details>
+    {% endif %}
+    {% if glance.polarity_line %}
+    <details class="promote-honesty promote-polarity{% if 'polarity' in warns %} warn{% endif %}"{% if 'polarity' in warns %} open{% endif %}>
+      <summary>Polarity <span class="meta">{{ fold_meta.polarity|default('quiet') }}</span></summary>
+      <p class="sub">How the closes split. Warn only. Not a gate.</p>
+      <p class="weight">{{ glance.polarity_line }}</p>
+    </details>
+    {% endif %}
+    {% if glance.edge_line %}
+    <details class="promote-honesty promote-edge{% if 'edge' in warns %} warn{% endif %}"{% if 'edge' in warns %} open{% endif %}>
+      <summary>Edge <span class="meta">{{ fold_meta.edge|default('quiet') }}</span></summary>
+      <p class="sub">Close quality after fees. Warn only. Not a gate.</p>
+      <p class="weight">{{ glance.edge_line }}</p>
+    </details>
+    {% endif %}
+    {% if glance.kelly_line %}
+    <details class="promote-honesty promote-kelly{% if 'Kelly' in warns %} warn{% endif %}"{% if 'Kelly' in warns %} open{% endif %}>
+      <summary>Kelly <span class="meta">{{ fold_meta.Kelly|default('quiet') }}</span></summary>
+      <p class="sub">Full, half, and quarter Kelly versus the cash slice. Warn only. Not a gate.</p>
+      <p class="weight">{{ glance.kelly_line }}</p>
+    </details>
+    {% endif %}
+    {% if glance.streak_line %}
+    <details class="promote-honesty promote-streaks{% if 'streaks' in warns %} warn{% endif %}"{% if 'streaks' in warns %} open{% endif %}>
+      <summary>Streaks <span class="meta">{{ fold_meta.streaks|default('quiet') }}</span></summary>
+      <p class="sub">Newest and past close runs, plus flat sells. Warn only. Not a gate.</p>
+      <p class="weight">{{ glance.streak_line }}</p>
+    </details>
+    {% endif %}
+    {% if glance.exit_mix_line %}
+    <details class="promote-honesty promote-exit-mix{% if 'exit mix' in warns %} warn{% endif %}"{% if 'exit mix' in warns %} open{% endif %}>
+      <summary>Exit mix <span class="meta">{{ fold_meta['exit mix']|default('quiet') }}</span></summary>
+      <p class="sub">Which close reasons fired (counts, not euros). Warn only. Not a gate.</p>
+      <p class="weight">{{ glance.exit_mix_line }}</p>
+    </details>
+    {% endif %}
+    {% if glance.exit_euro_line %}
+    <details class="promote-honesty promote-exit-euros{% if 'exit euros' in warns %} warn{% endif %}"{% if 'exit euros' in warns %} open{% endif %}>
+      <summary>Exit euros <span class="meta">{{ fold_meta['exit euros']|default('quiet') }}</span></summary>
+      <p class="sub">Which close reason owns the euros. Warn only. Not a gate.</p>
+      <p class="weight">{{ glance.exit_euro_line }}</p>
+    </details>
+    {% endif %}
+    {% if glance.fee_pressure_line %}
+    <details class="promote-honesty promote-fee-pressure{% if 'fee pressure' in warns %} warn{% endif %}"{% if 'fee pressure' in warns %} open{% endif %}>
+      <summary>Fee pressure <span class="meta">{{ fold_meta['fee pressure']|default('quiet') }}</span></summary>
+      <p class="sub">Clash leftover fees versus window fees. Warn only. Not a gate.</p>
+      <p class="weight">{{ glance.fee_pressure_line }}</p>
+    </details>
+    {% endif %}
+    {% if glance.align_nest_line %}
+    <details class="promote-honesty promote-align-nest{% if 'align nest' in warns %} warn{% endif %}"{% if 'align nest' in warns %} open{% endif %}>
+      <summary>Align nest <span class="meta">{{ fold_meta['align nest']|default('quiet') }}</span></summary>
+      <p class="sub">Nested align cascade after first share vs Δ. Warn only. Not a gate.</p>
+      <p class="weight">{{ glance.align_nest_line }}</p>
+    </details>
+    {% endif %}
+    {% if glance.align_deep_line %}
+    <details class="promote-honesty promote-align-deep{% if 'align deep' in warns %} warn{% endif %}"{% if 'align deep' in warns %} open{% endif %}>
+      <summary>Align deep <span class="meta">{{ fold_meta['align deep']|default('quiet') }}</span></summary>
+      <p class="sub">Second nest after nested share vs Δ align. Warn only. Not a gate.</p>
+      <p class="weight">{{ glance.align_deep_line }}</p>
+    </details>
+    {% endif %}
+  </details>
+  {% endif %}
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Live crypto policy honesty (display only). Screener may still list leaders. #}
+{% macro crypto_policy_glance(
+  snap,
+  heading_id='crypto-policy-glance-h',
+  link_href='/desk/screener#crypto-h',
+  link_label='Screener crypto →',
+  sub='Live buys: BTC/ETH only, one crypto slot, ±10% exits. Leaders on Screener are research, not auto-buy.'
+) -%}
+{% set glance = snap.crypto_policy_glance if snap.crypto_policy_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="crypto-policy-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Crypto policy</h2>
+  <p class="crypto-policy-glance-line">
+    <span class="crypto-policy-glance-tone {{ glance.tone }}">Crypto</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="crypto-policy-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="crypto-policy-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Stock exit asymmetry honesty (display only). Crypto uses wider bands. #}
+{% macro exit_policy_glance(
+  snap,
+  heading_id='exit-policy-glance-h',
+  link_href='/desk/book',
+  link_label='Book →',
+  sub='Live stock exits: TP +8% / SL −5% → designed RR 1.6 · rotate ≥+5%. Not ATR. Crypto ±10% → RR 1.0.'
+) -%}
+{% set glance = snap.exit_policy_glance if snap.exit_policy_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="exit-policy-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Stock exits</h2>
+  <p class="exit-policy-glance-line">
+    <span class="exit-policy-glance-tone {{ glance.tone }}">Exits</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="exit-policy-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="exit-policy-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Stock earnings blackout honesty (display only). Crypto exempt. #}
+{% macro earnings_blackout_glance(
+  snap,
+  heading_id='earnings-blackout-glance-h',
+  link_href='/desk/screener',
+  link_label='Screener →',
+  sub='Stock blackout 2d/1d. Empty or bad Yahoo → allow (suspect). Missing date → allow. Crypto exempt. Display only.'
+) -%}
+{% set glance = snap.earnings_blackout_glance if snap.earnings_blackout_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="earnings-blackout-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Earnings blackout</h2>
+  <p class="earnings-blackout-glance-line">
+    <span class="earnings-blackout-glance-tone {{ glance.tone }}">Earnings</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="earnings-blackout-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="earnings-blackout-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# AI mode + multi-role honesty (display only). FinRobot / TradingAgents. #}
+{% macro ai_mode_glance(
+  snap,
+  heading_id='ai-mode-glance-h',
+  link_href='/desk/ops#ops-ai-mode',
+  link_label='Ops AI →',
+  sub='AI path: off / validate / full + multi-role debate. Rules and gates still first. Display only.'
+) -%}
+{% set glance = snap.ai_mode_glance if snap.ai_mode_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="ai-mode-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">AI mode</h2>
+  <p class="ai-mode-glance-line">
+    <span class="ai-mode-glance-tone {{ glance.tone }}">AI</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="ai-mode-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="ai-mode-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# FinRobot multi-role research contract (display only). #}
+{% macro ai_roles_glance(
+  snap,
+  heading_id='ai-roles-glance-h',
+  link_href='/desk/ideas',
+  link_label='Ideas →',
+  sub='Validate multi-role: bull / bear / risk. Disagreement or risk veto → HOLD. Display only — not a research score.'
+) -%}
+{% set glance = snap.ai_roles_glance if snap.ai_roles_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="ai-roles-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">AI multi-role research contract</h2>
+  <p class="ai-roles-glance-line">
+    <span class="ai-roles-glance-tone {{ glance.tone }}">Roles</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="ai-roles-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="ai-roles-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# LAYA / JEV System-1 typed advisory (display only — not a gate). #}
+{% macro laya_glance(
+  snap,
+  heading_id='laya-glance-h',
+  link_href='/desk/ops#ops-ai-mode',
+  link_label='Ops AI →',
+  sub='Optional LAYA/JEV typed pass/hold/reject beside Ollama validate. Last row vs scan clock; clash when they disagree. Fail-open; not a buy gate. See docs/LAYA.md.'
+) -%}
+{% set glance = snap.laya_glance if snap.laya_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="laya-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">LAYA System-1 advisory</h2>
+  <p class="laya-glance-line">
+    <span class="laya-glance-tone {{ glance.tone }}">LAYA</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="laya-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="laya-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# FinRobot validate debate memory counts (display only). #}
+{% macro ai_debate_glance(
+  snap,
+  heading_id='ai-debate-glance-h',
+  link_href='/desk/ideas#debate-h',
+  link_label='Ideas debates →',
+  sub='Recent AI validate memory: BUY/HOLD/SELL + gated + age vs scan clock; clash when they disagree. Display only — not a research score.'
+) -%}
+{% set glance = snap.ai_debate_glance if snap.ai_debate_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="ai-debate-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">AI debate memory</h2>
+  <p class="ai-debate-glance-line">
+    <span class="ai-debate-glance-tone {{ glance.tone }}">Debates</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="ai-debate-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="ai-debate-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# FinRobot / TradingAgents AI top-N validate scope (display only). #}
+{% macro ai_validate_scope_glance(
+  snap,
+  heading_id='ai-validate-scope-glance-h',
+  link_href='/desk/ops#ops-ai-mode',
+  link_label='Ops AI →',
+  sub='AI checks top N only; rest keep scanner score. Validate drops SELL and HOLD·LOW. Display only.'
+) -%}
+{% set glance = snap.ai_validate_scope_glance if snap.ai_validate_scope_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="ai-validate-scope-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">AI validate scope</h2>
+  <p class="ai-validate-scope-glance-line">
+    <span class="ai-validate-scope-glance-tone {{ glance.tone }}">Scope</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="ai-validate-scope-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="ai-validate-scope-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# UTC session / weekend honesty (display only). xang1234 screener session UX. #}
+{% macro session_glance(
+  snap,
+  heading_id='session-glance-h',
+  link_href='/desk/screener',
+  link_label='Screener →',
+  sub='Weekday: stocks + crypto. Weekend: crypto-only (US equities paused). Display only.'
+) -%}
+{% set glance = snap.session_glance if snap.session_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="session-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Session mode</h2>
+  <p class="session-glance-line">
+    <span class="session-glance-tone {{ glance.tone }}">Session</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="session-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="session-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# US RTH vs Xetra cash hours (display only). Complements weekend session.
+   Active venues lead; closed cash speak attention on the line + sit behind a
+   disclosure (xang1234 #631 / #633 attention summary). #}
+{% macro equity_hours_glance(
+  snap,
+  heading_id='equity-hours-glance-h',
+  link_href='/desk/screener',
+  link_label='Screener →',
+  sub='US 09:30–16:00 ET · Xetra 09:00–17:30 Berlin for .DE · crypto 24/7. Display only — not a gate.'
+) -%}
+{% set glance = snap.equity_hours_glance if snap.equity_hours_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="equity-hours-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Equity cash hours</h2>
+  <p class="equity-hours-glance-line">
+    <span class="equity-hours-glance-tone {{ glance.tone }}">Hours</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="equity-hours-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="equity-hours-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  {% if glance.venue_chips_line %}
+  <p class="equity-hours-venue-chips" aria-label="Venue session chips">
+    {% set chips = glance.venue_chips if glance.venue_chips is sequence and glance.venue_chips is not string else [] %}
+    {% if chips %}
+    <span class="equity-hours-venue-group">Cash</span>
+    {% for chip in chips if chip.group == 'cash' %}
+    <span class="equity-hours-venue-chip {{ chip.status }}">{{ chip.label }}</span>
+    {% endfor %}
+    <span class="equity-hours-venue-group">Crypto</span>
+    {% for chip in chips if chip.group == 'crypto' %}
+    <span class="equity-hours-venue-chip {{ chip.status }}">{{ chip.label }}</span>
+    {% endfor %}
+    {% else %}
+    <span class="equity-hours-venue-chips-body">{{ glance.venue_chips_line }}</span>
+    {% endif %}
+  </p>
+  {% endif %}
+  {% if glance.inactive_line %}
+  {% set inactive_warn = glance.inactive_warn|default(false) %}
+  {% set inactive_meta = glance.inactive_meta|default('closed') %}
+  <details class="equity-hours-inactive{% if inactive_warn %} warn{% endif %}"{% if inactive_warn %} open{% endif %}>
+    <summary>inactive <span class="meta">{{ inactive_meta }}</span></summary>
+    <p class="equity-hours-inactive-body{% if inactive_warn %} warn{% endif %}">{{ glance.inactive_line }}</p>
+    <p class="sub">Closed cash sessions — crypto stays on the active line. Not a gate.</p>
+  </details>
+  {% endif %}
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Stock breakout entry honesty (display only). EXPE/NTRA lesson. #}
+{% macro breakout_guard_glance(
+  snap,
+  heading_id='breakout-guard-glance-h',
+  link_href='/desk/screener#brk-h',
+  link_label='Breakouts →',
+  sub='Stock breakouts need AI BUY, reject LOW, and a mild pullback. Display only — not a new gate.'
+) -%}
+{% set glance = snap.breakout_guard_glance if snap.breakout_guard_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="breakout-guard-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Breakout entry guards</h2>
+  <p class="breakout-guard-glance-line">
+    <span class="breakout-guard-glance-tone {{ glance.tone }}">Breakout</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="breakout-guard-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="breakout-guard-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# No loss-rotation honesty (display only). Never sell losers to chase scan names. #}
+{% macro loss_rotation_glance(
+  snap,
+  heading_id='loss-rotation-glance-h',
+  link_href='/desk/book',
+  link_label='Book →',
+  sub='Scan rotation never crystallizes losers. Winners need rotate hurdle; overweight trims winners first. Display only.'
+) -%}
+{% set glance = snap.loss_rotation_glance if snap.loss_rotation_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="loss-rotation-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Loss rotation policy</h2>
+  <p class="loss-rotation-glance-line">
+    <span class="loss-rotation-glance-tone {{ glance.tone }}">Rotate</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="loss-rotation-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="loss-rotation-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Stale-name rotation honesty (display only). SCHW flip-flop lesson. #}
+{% macro stale_rotation_glance(
+  snap,
+  heading_id='stale-rotation-glance-h',
+  link_href='/desk/book',
+  link_label='Book →',
+  sub='Stale only when off the full scan list, and only with a top-N replacement. Winners only. Display only — not a new gate.'
+) -%}
+{% set glance = snap.stale_rotation_glance if snap.stale_rotation_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="stale-rotation-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Stale rotation policy</h2>
+  <p class="stale-rotation-glance-line">
+    <span class="stale-rotation-glance-tone {{ glance.tone }}">Stale</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="stale-rotation-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="stale-rotation-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+
+{# Live book posture + next overweight trim (display only). #}
+{% macro book_posture_glance(
+  snap,
+  heading_id='book-posture-glance-h',
+  link_href='/desk/book',
+  link_label='Book →',
+  sub='Live open / at_cap / overweight vs max. Overweight shows next trim (winners first). Display only — not a new gate.'
+) -%}
+{% set glance = snap.book_posture_glance if snap.book_posture_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="book-posture-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Book posture</h2>
+  <p class="book-posture-glance-line">
+    <span class="book-posture-glance-tone {{ glance.tone }}">Posture</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="book-posture-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="book-posture-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Junk / noise filter honesty (display only). Stables, leveraged, sub-$1 crypto. #}
+{% macro junk_filter_glance(
+  snap,
+  heading_id='junk-filter-glance-h',
+  link_href='/desk/screener',
+  link_label='Screener →',
+  sub='Scan drops stables, leveraged tokens, and noise. Crypto buys need ≥ $1. Display only — not a new gate.'
+) -%}
+{% set glance = snap.junk_filter_glance if snap.junk_filter_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="junk-filter-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Junk and noise filters</h2>
+  <p class="junk-filter-glance-line">
+    <span class="junk-filter-glance-tone {{ glance.tone }}">Filter</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="junk-filter-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="junk-filter-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Universe / Yahoo movers discovery honesty (display only). Cache age vs 24h. #}
+{% macro universe_discovery_glance(
+  snap,
+  heading_id='universe-discovery-glance-h',
+  link_href='/desk/screener',
+  link_label='Screener →',
+  sub='Yahoo movers grow the curated US+DE scan list only. A complete US movers snapshot drops US yahoo_mover names the source no longer lists (dropped N · US); Xetra rows are out of that baseline. Empty/blocked Yahoo does not prune. Fail path keeps the last good seed clock age (seed Nh ago · fresh|aging|stale), speaks fail Nh ago · band, seed lags / fail lags when those bands disagree, plus retry due — it does not inherit the 24h success throttle. timeout↔inflight mix sits under mix lean. Claim-drop vs kept / claim-live vs free severity lean sits under claim lean when share bands spoke. First-fail error/seed · budget lean sits under error lean. Streak/seed · fail · budget lean sits under streak lean when N× spoke. Buys still need gates. Display only — not a new gate.'
+) -%}
+{% set glance = snap.universe_discovery_glance if snap.universe_discovery_glance is mapping else {} %}
+{% if glance.ready %}
+{% set body_line = glance.line_core|default(glance.line|default('')) %}
+{% set mix_lean = glance.mix_lean|default('') %}
+{% set mix_warn = glance.mix_lean_warn|default(false) %}
+{% set mix_meta = glance.mix_lean_meta|default('quiet') %}
+{% set claim_lean = glance.claim_lean|default('') %}
+{% set claim_warn = glance.claim_lean_warn|default(false) %}
+{% set claim_meta = glance.claim_lean_meta|default('quiet') %}
+{% set claim_open = glance.claim_lean_open|default(claim_warn) %}
+{% set error_lean = glance.error_lean|default('') %}
+{% set error_warn = glance.error_lean_warn|default(false) %}
+{% set error_meta = glance.error_lean_meta|default('quiet') %}
+{% set streak_lean = glance.streak_lean|default('') %}
+{% set lean_warn = glance.streak_lean_warn|default(false) %}
+{% set streak_meta = glance.streak_lean_meta|default('quiet') %}
+<section class="universe-discovery-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Universe discovery</h2>
+  <p class="universe-discovery-glance-line">
+    <span class="universe-discovery-glance-tone {{ glance.tone }}">Universe</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="universe-discovery-glance-body">{{ body_line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="universe-discovery-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  {% if mix_lean %}
+  <details class="universe-mix-lean{% if mix_warn %} warn{% endif %}"{% if mix_warn %} open{% endif %}>
+    <summary>mix lean <span class="meta">{{ mix_meta }}</span></summary>
+    <p class="universe-mix-lean-body{% if mix_warn %} warn{% endif %}">{{ mix_lean }}</p>
+  </details>
+  {% endif %}
+  {% if claim_lean %}
+  <details class="universe-claim-lean{% if claim_warn %} warn{% endif %}"{% if claim_open %} open{% endif %}>
+    <summary>claim lean <span class="meta">{{ claim_meta }}</span></summary>
+    <p class="universe-claim-lean-body{% if claim_warn %} warn{% endif %}">{{ claim_lean }}</p>
+  </details>
+  {% endif %}
+  {% if error_lean %}
+  <details class="universe-error-lean{% if error_warn %} warn{% endif %}"{% if error_warn %} open{% endif %}>
+    <summary>error lean <span class="meta">{{ error_meta }}</span></summary>
+    <p class="universe-error-lean-body{% if error_warn %} warn{% endif %}">{{ error_lean }}</p>
+  </details>
+  {% endif %}
+  {% if streak_lean %}
+  <details class="universe-streak-lean{% if lean_warn %} warn{% endif %}"{% if lean_warn %} open{% endif %}>
+    <summary>streak lean <span class="meta">{{ streak_meta }}</span></summary>
+    <p class="universe-streak-lean-body{% if lean_warn %} warn{% endif %}">{{ streak_lean }}</p>
+  </details>
+  {% endif %}
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Screener ATR / R:R honesty (display only). Live exits use TP/SL, not ATR. #}
+{% macro atr_display_glance(
+  snap,
+  heading_id='atr-display-glance-h',
+  link_href='/desk/screener',
+  link_label='Screener →',
+  sub='Missing vol → soft n/a (display), not refuse. Live stock exits use TP/SL — not ATR stops.'
+) -%}
+{% set glance = snap.atr_display_glance if snap.atr_display_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="atr-display-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">ATR display-only policy</h2>
+  <p class="atr-display-glance-line">
+    <span class="atr-display-glance-tone {{ glance.tone }}">ATR</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="atr-display-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="atr-display-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Entry score band + crypto/stock interleave honesty (A11; display only). #}
+{% macro entry_slots_glance(
+  snap,
+  heading_id='entry-slots-glance-h',
+  link_href='/desk/screener',
+  link_label='Screener →',
+  sub='Stock breakout scores use 40+pct_from_high; entries interleave crypto/stock slots — not a pure global sort. Display only.'
+) -%}
+{% set glance = snap.entry_slots_glance if snap.entry_slots_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="entry-slots-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Entry slot ranking</h2>
+  <p class="entry-slots-glance-line">
+    <span class="entry-slots-glance-tone {{ glance.tone }}">Slots</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="entry-slots-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="entry-slots-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Promote = entry veto only (A18; display only). #}
+{% macro promote_contract_glance(
+  snap,
+  heading_id='promote-contract-glance-h',
+  link_href='/desk/ops#ops-promote',
+  link_label='Ops promote →',
+  sub='Champion filters new buys only when promote is on. Exits stay in exit_policy; SELL never becomes a buy. Display only.'
+) -%}
+{% set glance = snap.promote_contract_glance if snap.promote_contract_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="promote-contract-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Promote entry contract</h2>
+  <p class="promote-contract-glance-line">
+    <span class="promote-contract-glance-tone {{ glance.tone }}">Promote</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="promote-contract-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="promote-contract-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Regime vs RS vs breadth roles (A14; display only). #}
+{% macro gate_roles_glance(
+  snap,
+  heading_id='gate-roles-glance-h',
+  link_href='/desk/ops#ops-regime',
+  link_label='Ops gates →',
+  sub='Regime = absolute benchmark trend; RS = name vs benchmark; breadth = scan-list A/D. If starved, turn RS off first. Display only.'
+) -%}
+{% set glance = snap.gate_roles_glance if snap.gate_roles_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="gate-roles-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Entry gate roles</h2>
+  <p class="gate-roles-glance-line">
+    <span class="gate-roles-glance-tone {{ glance.tone }}">Roles</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="gate-roles-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="gate-roles-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Soft-gate numeric thresholds (RyanJHamby / xang1234; display only). #}
+{% macro gate_params_glance(
+  snap,
+  heading_id='gate-params-glance-h',
+  link_href='/desk/ops#ops-regime',
+  link_label='Ops gates →',
+  sub='SMA / RS use SPY as an S&P 500 ETF proxy (not ^GSPC) and Binance BTCUSDT (not Yahoo BTC-USD). Lookback / anchor-gap ceiling / scan A/D mins beside gate toggles. Fail-open on short bars. Display only — not a new gate.'
+) -%}
+{% set glance = snap.gate_params_glance if snap.gate_params_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="gate-params-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Entry gate parameters</h2>
+  <p class="gate-params-glance-line" title="{{ glance.stock_benchmark_identity or 'SPY · ETF proxy · not ^GSPC' }} · {{ glance.crypto_benchmark_identity or 'BTCUSDT · Binance pair · not BTC-USD' }}">
+    <span class="gate-params-glance-tone {{ glance.tone }}">Params</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="gate-params-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="gate-params-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Book caps + fee schedule honesty (display only). Packaging ≠ edge. #}
+{% macro book_limits_glance(
+  snap,
+  heading_id='book-limits-glance-h',
+  link_href='/desk/ops#ops-max-pos',
+  link_label='Ops book →',
+  sub='Max slots · min hold · fee preset — anti-churn packaging, not edge. Not a gate.'
+) -%}
+{% set glance = snap.book_limits_glance if snap.book_limits_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="book-limits-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Book limits</h2>
+  <p class="book-limits-glance-line">
+    <span class="book-limits-glance-tone {{ glance.tone }}">Book</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="book-limits-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="book-limits-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Anti flip-flop rebuy cooldown honesty (display only). #}
+{% macro rebuy_cooldown_glance(
+  snap,
+  heading_id='rebuy-cooldown-glance-h',
+  link_href='/desk/ops#ops-min-hold',
+  link_label='Ops hold →',
+  sub='Same-symbol rebuy lock after exit (min hold) — warns within ~15m of unlock. Not a gate.'
+) -%}
+{% set glance = snap.rebuy_cooldown_glance if snap.rebuy_cooldown_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="rebuy-cooldown-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Rebuy cooldown</h2>
+  <p class="rebuy-cooldown-glance-line">
+    <span class="rebuy-cooldown-glance-tone {{ glance.tone }}">Rebuy</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="rebuy-cooldown-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="rebuy-cooldown-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Soft daily-loss halt progress (display only). Pretrade FAIL when tripped. #}
+{% macro daily_loss_glance(
+  snap,
+  heading_id='daily-loss-glance-h',
+  link_href='/desk/ops',
+  link_label='Ops →',
+  sub='UTC-day realized loss vs −2% start capital — soft buy halt. Not a new gate.'
+) -%}
+{% set glance = snap.daily_loss_glance if snap.daily_loss_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="daily-loss-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Daily loss halt</h2>
+  <p class="daily-loss-glance-line">
+    <span class="daily-loss-glance-tone {{ glance.tone }}">Day loss</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="daily-loss-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="daily-loss-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Largest name vs 30% entry concentration cap (display only). #}
+{% macro concentration_glance(
+  snap,
+  heading_id='concentration-glance-h',
+  link_href='/desk/book',
+  link_label='Book →',
+  sub='Largest name vs 30% equity entry cap — soft size limit on new fills. Funds clash/align under conc lean. Not a new gate.'
+) -%}
+{% set glance = snap.concentration_glance if snap.concentration_glance is mapping else {} %}
+{% if glance.ready %}
+{% set conc_lean = glance.lean|default('') %}
+{% set conc_lean_warn = glance.lean_warn|default(false) %}
+{% set conc_lean_meta = glance.lean_meta|default('quiet') %}
+<section class="concentration-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Concentration</h2>
+  <p class="concentration-glance-line">
+    <span class="concentration-glance-tone {{ glance.tone }}">Conc</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="concentration-glance-body{% if glance.warn %} warn{% endif %}">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="concentration-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  {% if conc_lean %}
+  <details class="concentration-funds-lean{% if conc_lean_warn %} warn{% endif %}"{% if conc_lean_warn %} open{% endif %}>
+    <summary>conc lean <span class="meta">{{ conc_lean_meta }}</span></summary>
+    <p class="concentration-funds-lean-body{% if conc_lean_warn %} warn{% endif %}">{{ conc_lean }}</p>
+  </details>
+  {% endif %}
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Same-theme ETF/ETC doubles on the open book (display only). #}
+{% macro listed_fund_overlap_glance(
+  snap,
+  heading_id='listed-fund-overlap-glance-h',
+  link_href='/desk/book',
+  link_label='Book →',
+  sub='Curated funds that share an economic theme (gold, silver, US equity). Vs-other / ownership / Conc sit under funds lean. Display only — not a new gate.'
+) -%}
+{% set glance = snap.listed_fund_overlap_glance if snap.listed_fund_overlap_glance is mapping else {} %}
+{% if glance.ready %}
+{% set body_line = glance.line|default(glance.bit_core|default('')) %}
+{% set funds_lean = glance.lean|default('') %}
+{% set funds_lean_warn = glance.lean_warn|default(false) %}
+{% set funds_lean_meta = glance.lean_meta|default('quiet') %}
+<section class="listed-fund-overlap-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Listed fund overlap</h2>
+  <p class="listed-fund-overlap-glance-line">
+    <span class="listed-fund-overlap-glance-tone {{ glance.tone }}">Funds</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="listed-fund-overlap-glance-body{% if glance.warn %} warn{% endif %}">{{ body_line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="listed-fund-overlap-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  {% if funds_lean %}
+  <details class="listed-fund-overlap-lean{% if funds_lean_warn %} warn{% endif %}"{% if funds_lean_warn %} open{% endif %}>
+    <summary>funds lean <span class="meta">{{ funds_lean_meta }}</span></summary>
+    <p class="listed-fund-overlap-lean-body{% if funds_lean_warn %} warn{% endif %}">{{ funds_lean }}</p>
+  </details>
+  {% endif %}
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Post-SL buy cooldown (display only). Derived from last stop-loss sell. #}
+{% macro post_sl_cooldown_glance(
+  snap,
+  heading_id='post-sl-glance-h',
+  link_href='/desk#pretrade-h',
+  link_label='Pre-trade →',
+  sub='After a stop-loss sell, new buys stay blocked ≥4h — warns within ~15m of unlock. Not a new gate.'
+) -%}
+{% set glance = snap.post_sl_cooldown_glance if snap.post_sl_cooldown_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="post-sl-cooldown-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Post stop-loss cooldown</h2>
+  <p class="post-sl-cooldown-glance-line">
+    <span class="post-sl-cooldown-glance-tone {{ glance.tone }}">Post-SL</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="post-sl-cooldown-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="post-sl-cooldown-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Scan / trade loop cadence vs anti-churn floors (display only). #}
+{% macro loop_cadence_glance(
+  snap,
+  heading_id='loop-cadence-glance-h',
+  link_href='/desk/ops#ops-scan-trade',
+  link_label='Ops cadence →',
+  sub='Scan vs trade sleep — product floors ≥15m / ≥5m. Packaging ≠ edge. Not a gate.'
+) -%}
+{% set glance = snap.loop_cadence_glance if snap.loop_cadence_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="loop-cadence-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Loop cadence</h2>
+  <p class="loop-cadence-glance-line">
+    <span class="loop-cadence-glance-tone {{ glance.tone }}">Cadence</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="loop-cadence-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="loop-cadence-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Hourly Cursor improve tick age (display only). Missing overnight logs stay silent. #}
+{% macro improve_tick_glance(
+  snap,
+  heading_id='improve-tick-glance-h',
+  link_href='/desk/ops#logs-h',
+  link_label='Ops logs →',
+  sub='Last Cursor improve tick vs hourly cadence — fresh ≤75m · aging ≤3h · else stale. Degraded clocks speak start only / loop tick / log mtime (mtime+start escalate fresh→aging). Clash vs scan archive when bands disagree. Status/age vs scan + source vs scan + fresher/gap + gap sides + fresher vs status/age lean under fold when meters spoke. Failed rc warns. Not a gate.'
+) -%}
+{% set glance = snap.improve_tick_glance if snap.improve_tick_glance is mapping else {} %}
+{% if glance.ready %}
+{% set improve_lean = glance.lean|default('') %}
+{% set improve_lean_warn = glance.lean_warn|default(false) %}
+{% set improve_lean_open = glance.lean_open|default(improve_lean_warn) %}
+{% set improve_lean_meta = glance.lean_meta|default('quiet') %}
+<section class="improve-tick-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Improve tick</h2>
+  <p class="improve-tick-glance-line">
+    <span class="improve-tick-glance-tone {{ glance.tone }}">Improve</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="improve-tick-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="improve-tick-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  {% if improve_lean %}
+  <details class="improve-tick-lean{% if improve_lean_warn %} warn{% endif %}"{% if improve_lean_open %} open{% endif %}>
+    <summary>improve lean <span class="meta">{{ improve_lean_meta }}</span></summary>
+    <p class="improve-tick-lean-body{% if improve_lean_warn %} warn{% endif %}">{{ improve_lean }}</p>
+  </details>
+  {% endif %}
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Revolut-like free legs left this month (display only). Crypto fees not modeled. #}
+{% macro fee_allowance_glance(
+  snap,
+  heading_id='fee-allowance-glance-h',
+  link_href='/desk/ops#ops-fee-preset',
+  link_label='Ops fees →',
+  sub='Free monthly legs before paid fills — Revolut-like paper. Crypto fee schedules not modeled. Not a gate.'
+) -%}
+{% set glance = snap.fee_allowance_glance if snap.fee_allowance_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="fee-allowance-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Fee allowance</h2>
+  <p class="fee-allowance-glance-line">
+    <span class="fee-allowance-glance-tone {{ glance.tone }}">Free legs</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="fee-allowance-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="fee-allowance-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+{# Fee drag vs start + realized P&L (display only). Overview strip keeps raw € fees. #}
+{% macro fee_burn_glance(
+  snap,
+  heading_id='fee-burn-glance-h',
+  link_href='/desk/ops#ops-fee-preset',
+  link_label='Ops fees →',
+  sub='Fees vs start and realized P&L — high (≥2% start or fees > P&L) suggests reset or longer holds. Not a gate.'
+) -%}
+{% set glance = snap.fee_burn_glance if snap.fee_burn_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="fee-burn-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Fee burn</h2>
+  <p class="fee-burn-glance-line">
+    <span class="fee-burn-glance-tone {{ glance.tone }}">Fees</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="fee-burn-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="fee-burn-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+{% macro stuck_capital_glance(
+  snap,
+  heading_id='stuck-capital-glance-h',
+  link_href='/desk/book',
+  link_label='Book →',
+  sub='Past min-hold and underwater — capital trapped until TP/SL/trim. Not a gate.'
+) -%}
+{% set glance = snap.stuck_capital_glance if snap.stuck_capital_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="stuck-capital-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Stuck capital</h2>
+  <p class="stuck-capital-glance-line">
+    <span class="stuck-capital-glance-tone {{ glance.tone }}">Stuck</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="stuck-capital-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="stuck-capital-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+{# Open lots still inside min-hold (display only). Pairs with stuck-capital. #}
+{% macro min_hold_lock_glance(
+  snap,
+  heading_id='min-hold-lock-glance-h',
+  link_href='/desk/ops#ops-min-hold',
+  link_label='Ops hold →',
+  sub='Lots still inside min-hold cannot rotate/trim — warns within ~15m of unlock. Missing entry stamp speaks no entry (hold age unknown). Not a gate.'
+) -%}
+{% set glance = snap.min_hold_lock_glance if snap.min_hold_lock_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="min-hold-lock-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Min-hold lock</h2>
+  <p class="min-hold-lock-glance-line">
+    <span class="min-hold-lock-glance-tone {{ glance.tone }}">Hold lock</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="min-hold-lock-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="min-hold-lock-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+{# Last closed-round memory (display only). Book keeps the full list. #}
+{% macro postmortem_glance(
+  snap,
+  heading_id='postmortem-glance-h',
+  link_href='/desk/book#post-h',
+  link_label='Book rounds →',
+  sub='Newest FIFO exit — thesis lives on Book. Unmatched vs matched sits under lean. No MAE/MFE without a path. Not a gate.'
+) -%}
+{% set glance = snap.postmortem_glance if snap.postmortem_glance is mapping else {} %}
+{% if glance.ready %}
+{% set postmortem_lean = glance.lean|default('') %}
+{% set postmortem_lean_warn = glance.lean_warn|default(false) %}
+{% set postmortem_lean_meta = glance.lean_meta|default('quiet') %}
+<section class="postmortem-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Last closed round</h2>
+  <p class="postmortem-glance-line">
+    <span class="postmortem-glance-tone {{ glance.tone }}">Exit</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="postmortem-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="postmortem-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  {% if postmortem_lean %}
+  <details class="postmortem-unmatched-lean{% if postmortem_lean_warn %} warn{% endif %}"{% if postmortem_lean_warn %} open{% endif %}>
+    <summary>exit lean <span class="meta">{{ postmortem_lean_meta }}</span></summary>
+    <p class="postmortem-unmatched-lean-body{% if postmortem_lean_warn %} warn{% endif %}">{{ postmortem_lean }}</p>
+  </details>
+  {% endif %}
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+
+
+{# Display-only next-buy € (tradermonty sizer). Overview keeps the full size block. #}
+{% macro next_buy_glance(
+  snap,
+  heading_id='next-buy-glance-h',
+  link_href='/desk',
+  link_label='Overview size →',
+  sub='Suggested notional (cash frac · concentration · slots) — display only; not a gate.'
+) -%}
+{% set glance = snap.next_buy_glance if snap.next_buy_glance is mapping else {} %}
+{% if glance.ready %}
+<section class="next-buy-glance" aria-labelledby="{{ heading_id }}">
+  <h2 id="{{ heading_id }}" class="visually-hidden">Next buy size</h2>
+  <p class="next-buy-glance-line">
+    <span class="next-buy-glance-tone {{ glance.tone }}">Size</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="next-buy-glance-body">{{ glance.line }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <a class="next-buy-glance-link" href="{{ link_href }}">{{ link_label }}</a>
+  </p>
+  <p class="sub">{{ sub }}</p>
+</section>
+{% endif %}
+{%- endmacro %}
+
+{% macro fill_row(t) -%}
+<li>
+  <span class="when">{{ t.timestamp }}</span>
+  <span class="side {{ t.type|lower }}">{{ t.type }}</span>
+  {{ ticker(t.symbol, t.name) }}
+  {% if t.fill_ok is defined and not t.fill_ok %}
+  <span class="meta warn" title="Bool/gap/0 qty·price or bad commission refused — True→1 invent blocked (Charts equity-curve parity)">damaged fill · qty/price unreadable</span>
+  {% else %}
+  <span class="meta">{{ "%.4f"|format(t.quantity) }} @ €{{ t.price|px }} · fee €{{ "%.2f"|format(t.commission) }}</span>
+  {% endif %}
+  <span class="amt{% if t.profit_loss is not none %} {% if t.profit_loss|float >= 0 %}up{% else %}down{% endif %}{% endif %}">
+    {% if t.profit_loss is not none %}
+    €{{ "{:+,.2f}".format(t.profit_loss|float) }}{% if t.profit_loss_pct is not none %}<small>{{ "%+.1f"|format(t.profit_loss_pct|float) }}%</small>{% endif %}
+    {% else %}—{% endif %}
+  </span>
+  {% if t.note or t.strategy or t.exit_reason %}
+  <span class="trade-why why">
+    {%- if t.type == 'SELL' and t.exit_reason -%}
+    <span class="strat">{{ t.exit_reason }}</span>{% if t.note %} · {% endif %}
+    {%- elif t.strategy -%}
+    <span class="strat">{{ t.strategy }}</span>{% if t.note %} · {% endif %}
+    {%- endif -%}
+    {{ t.note or '' }}{% if t.type == 'BUY' and t.score is not none %} · score {{ "%.0f"|format(t.score|float) }}{% endif %}
+  </span>
+  {% endif %}
+</li>
+{%- endmacro %}

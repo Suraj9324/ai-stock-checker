@@ -1,0 +1,2753 @@
+"""Chart series for the paper desk (equity, allocation, price history)."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from openbb_backend.symbol_names import display_name, resolve_symbol_names
+
+# xang1234 #498: chart cache basenames stay under chart_bars/ (no path escape).
+_CHART_CACHE_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._=-]{0,63}$")
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    # tradermonty #700/#655 + xang1234/portfolio AI: bool must not invent
+    # True→1.0 into closes / qty / cash / marks (float(True) succeeds).
+    if isinstance(value, bool):
+        return default
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return default
+    return n if math.isfinite(n) else default
+
+
+def _chart_count(value: object, default: int = 0) -> int:
+    """Non-neg panel/meter count; bool/gap → default (never ``True→1``).
+
+    tradermonty #700/#655 + xang1234/portfolio AI — Charts bar lean helpers
+    must not invent a one-panel spoken/fresh/aging/stale sample from bool.
+    """
+    from stock_checker.technical_indicators import coerce_nonneg_int
+
+    n = coerce_nonneg_int(value)
+    return default if n is None else n
+
+
+def _chart_slots(value: object, default: int = 5) -> int:
+    """Book slot cap; bool/≤0 → default (never ``True→1`` slot)."""
+    n = _chart_count(value, default=-1)
+    return default if n < 1 else n
+
+
+def _chart_hold_hours(value: object, default: float = 24.0) -> float:
+    """Min-hold hours; bool/gap → default (never ``True→1h``)."""
+    from stock_checker.technical_indicators import _finite_signed
+
+    if not _finite_signed(value):
+        return float(default)
+    return float(value)  # type: ignore[arg-type]
+
+
+def _chart_share(value: object) -> float | None:
+    """Finite share % (may be 0), else None — never ``float(True)→1``.
+
+    Book short/long ``_sample_share`` parity: spoken/fresh + aging/stale
+    Δ helpers previously accepted bare ``float(True)``.
+    """
+    from stock_checker.technical_indicators import _finite_signed
+
+    if value is None or not _finite_signed(value):
+        return None
+    return float(value)  # type: ignore[arg-type]
+
+
+def _chart_delta_pp(value: object) -> int | None:
+    """Signed Δ pp, else None — never ``int(True)→1`` inventing a sleeve lead."""
+    from stock_checker.technical_indicators import _finite_signed
+
+    if value is None or not _finite_signed(value):
+        return None
+    return int(value)  # type: ignore[arg-type]
+
+
+def _load_json(path: Path, default: Any) -> Any:
+    """Parse JSON via desk lean-checked loader (xang1234 #498 / #540)."""
+    from openbb_backend.desk import load_json_checked
+
+    doc, _meta = load_json_checked(path, default)
+    return doc
+
+
+def _load_opportunities(data_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Prefer opportunities_latest; fall back like desk (xang1234 #682/#685).
+
+    Charts used to hard-read ``opportunities_latest.json`` only — a missing,
+    dangling, or stale pin hid the newest publish that desk already falls
+    back to. Returns ``(opportunities, archive_res)``.
+    """
+    from openbb_backend.desk import resolve_opportunities_archive
+
+    archive_res = resolve_opportunities_archive(data_dir)
+    opp = _load_json(Path(archive_res["path"]), {})
+    if not isinstance(opp, dict):
+        opp = {}
+    return opp, archive_res
+
+
+def _parse_chart_points(raw: Any) -> list[dict[str, Any]]:
+    """Parse advertised chart points — presence alone is not enough.
+
+    xang1234 c6f8650: require a list of point objects with finite closes;
+    skip non-dicts and junk closes rather than treating a truthy blob as hit.
+    """
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for p in raw:
+        if not isinstance(p, dict):
+            continue
+        close = _finite(p.get("close"), default=float("nan"))
+        if not math.isfinite(close):
+            continue
+        out.append({"t": p.get("t"), "close": round(close, 6)})
+    return out
+
+
+def _load_jsonl(path: Path) -> list[dict]:
+    from openbb_backend.desk import load_jsonl_checked
+
+    rows, _meta = load_jsonl_checked(path)
+    return rows
+
+
+def _parse_trade_ts(raw: str) -> Optional[datetime]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            dt = datetime.strptime(raw[:26], fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(
+            timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _curve_commission(value: Any) -> Optional[float]:
+    """Commission may be 0; refuse bool/NaN/negative (``True→€1`` invent)."""
+    from stock_checker.technical_indicators import _finite_signed
+
+    if value is None:
+        return 0.0
+    if not _finite_signed(value):
+        return None
+    c = float(value)
+    if c < 0.0:
+        return None
+    return c
+
+
+def _curve_cash(value: Any) -> Optional[float]:
+    """Cash / cash_remaining: finite ≥0, never bool."""
+    from stock_checker.technical_indicators import _finite_signed
+
+    if not _finite_signed(value):
+        return None
+    c = float(value)
+    if c < 0.0:
+        return None
+    return c
+
+
+def _curve_signed(value: Any) -> Optional[float]:
+    """Signed P&L may be ≤0; refuse bool/NaN (``True→+€1`` invent)."""
+    from stock_checker.technical_indicators import _finite_signed
+
+    if value is None:
+        return None
+    if not _finite_signed(value):
+        return None
+    return float(value)
+
+
+def build_equity_curve(data_dir: Path) -> list[dict[str, Any]]:
+    """Book equity after each fill (cash + cost basis of open lots)."""
+    from stock_checker.portfolio import fill_price_ok, long_only_quantity_ok
+    from stock_checker.technical_indicators import _valid_close
+
+    portfolio = _load_json(data_dir / "portfolio.json", {})
+    trades = _load_jsonl(data_dir / "trades.jsonl")
+    # tradermonty #700 / #655: missing/bool initial must not invent €0 / €1 start
+    initial = _curve_cash(portfolio.get("initial_cash"))
+    if initial is None:
+        initial = 0.0
+    cash = initial
+    lots: dict[str, dict[str, float]] = {}  # symbol -> {qty, cost}
+    points: list[dict[str, Any]] = []
+
+    start_ts = None
+    if trades:
+        start_ts = _parse_trade_ts(str(trades[0].get("timestamp") or ""))
+    if start_ts is None and portfolio.get("last_updated"):
+        start_ts = _parse_trade_ts(str(portfolio["last_updated"]))
+    if start_ts is None:
+        start_ts = datetime.now(timezone.utc)
+
+    points.append(
+        {
+            "t": start_ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "equity": round(initial, 2),
+            "cash": round(initial, 2),
+            "invested": 0.0,
+            "label": "start",
+        }
+    )
+
+    for trade in trades:
+        if not isinstance(trade, dict):
+            continue
+        side = str(trade.get("type") or "").upper()
+        sym = str(trade.get("symbol") or "")
+        # tradermonty #700 silent entry_price 0 + #655 True→1.0: skip junk fills
+        # rather than invent €0 / 1-share / €1 commission into the curve.
+        if not long_only_quantity_ok(trade.get("quantity")):
+            continue
+        if not fill_price_ok(trade.get("price")):
+            continue
+        commission = _curve_commission(trade.get("commission"))
+        if commission is None:
+            continue
+        qty = float(trade.get("quantity"))
+        price = float(trade.get("price"))
+        ts = _parse_trade_ts(str(trade.get("timestamp") or "")) or start_ts
+
+        if side == "BUY":
+            total = qty * price + commission
+            cash -= total
+            lot = lots.setdefault(sym, {"qty": 0.0, "cost": 0.0})
+            lot["qty"] += qty
+            lot["cost"] += qty * price
+            rem = trade.get("cash_remaining")
+            if rem is not None:
+                rem_ok = _curve_cash(rem)
+                if rem_ok is not None:
+                    cash = rem_ok
+        elif side == "SELL":
+            lot = lots.setdefault(sym, {"qty": 0.0, "cost": 0.0})
+            avg = (lot["cost"] / lot["qty"]) if lot["qty"] else price
+            proceeds = qty * price - commission
+            cash += proceeds
+            lot["qty"] = max(0.0, lot["qty"] - qty)
+            lot["cost"] = max(0.0, lot["qty"] * avg)
+            if lot["qty"] <= 1e-12:
+                lots.pop(sym, None)
+            rem = trade.get("cash_remaining")
+            if rem is not None:
+                rem_ok = _curve_cash(rem)
+                if rem_ok is not None:
+                    cash = rem_ok
+        else:
+            continue
+
+        invested = sum(v["cost"] for v in lots.values())
+        # Prefer live portfolio cash if this is the last trade
+        equity = cash + invested
+        points.append(
+            {
+                "t": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "equity": round(equity, 2),
+                "cash": round(cash, 2),
+                "invested": round(invested, 2),
+                "label": f"{side} {sym}".strip(),
+            }
+        )
+
+    # Anchor current book mark if available
+    holdings = portfolio.get("holdings") or {}
+    avg = portfolio.get("avg_buy_price") or {}
+    if holdings:
+        cash_now = _curve_cash(portfolio.get("cash"))
+        if cash_now is None:
+            cash_now = cash
+        invested_now = 0.0
+        for s, q in holdings.items():
+            if not long_only_quantity_ok(q):
+                continue
+            cost = avg.get(s)
+            if not _valid_close(cost):
+                continue
+            invested_now += float(q) * float(cost)
+        points.append(
+            {
+                "t": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "equity": round(cash_now + invested_now, 2),
+                "cash": round(cash_now, 2),
+                "invested": round(invested_now, 2),
+                "label": "now",
+            }
+        )
+    return points
+
+
+def build_allocation(data_dir: Path) -> list[dict[str, Any]]:
+    from openbb_backend.desk import load_desk_snapshot
+
+    # Cost/scan marks only — keep chart payload snappy.
+    snap = load_desk_snapshot(
+        data_dir,
+        live_marks=False,
+        price_fetcher=lambda _s: {},
+    )
+    # Prefer MTM weights from snapshot holdings (refuse bool/gap invent).
+    rows = []
+    for h in snap.get("holdings") or []:
+        mv = _curve_cash(h.get("market_value"))
+        w = _curve_cash(h.get("weight_pct"))
+        if mv is None:
+            continue
+        rows.append(
+            {
+                "symbol": h["symbol"],
+                "name": h.get("name") or "",
+                "value": round(mv, 2),
+                "weight_pct": round(w if w is not None else 0.0, 2),
+                "kind": h.get("kind") or "stock",
+            }
+        )
+    cash = _curve_cash(snap.get("cash"))
+    if cash is None:
+        cash = 0.0
+    equity = _curve_cash(snap.get("equity"))
+    if equity is None or equity <= 0.0:
+        equity = cash  # no invent €1 divisor when book equity is unreadable
+    cash_w = (cash / equity * 100) if equity > 0 else 0.0
+    rows.append(
+        {
+            "symbol": "CASH",
+            "name": "Cash",
+            "value": round(cash, 2),
+            "weight_pct": round(cash_w, 2),
+            "kind": "cash",
+        }
+    )
+    rows.sort(key=lambda r: r["value"], reverse=True)
+    return rows
+
+
+def _safe_chart_cache_token(raw: str) -> str | None:
+    """Basename token for chart_bars — reject empty / escape / junk.
+
+    xang1234 #498 advertised-path containment: slash→underscore keeps
+    BTC/USDT-style names; ``..`` and other path junk stay out.
+    """
+    text = str(raw or "").strip().replace("/", "_").replace("\\", "_")
+    if not text or ".." in text or not _CHART_CACHE_TOKEN.match(text):
+        return None
+    return text
+
+
+def _cache_path(
+    data_dir: Path, symbol: str, interval: str = "1d"
+) -> Path | None:
+    """Resolve a chart cache file under ``chart_bars/`` or None if unsafe.
+
+    xang1234 #498 / 464a0ce: resolved path must stay inside the chart root
+    (``is_relative_to``); empty/malformed tokens refuse the cache slot.
+    """
+    safe = _safe_chart_cache_token(symbol)
+    if safe is None:
+        return None
+    root = (Path(data_dir) / "chart_bars").resolve()
+    if interval in {"1d", "d", "day", "daily"}:
+        name = f"{safe}.json"
+    else:
+        safe_iv = _safe_chart_cache_token(interval)
+        if safe_iv is None:
+            return None
+        name = f"{safe}_{safe_iv}.json"
+    try:
+        path = (root / name).resolve()
+    except (OSError, ValueError):
+        return None
+    if not path.is_relative_to(root):
+        return None
+    return path
+
+
+def _coerce_chart_days(value: object, default: int = 90) -> int:
+    """Positive history-day window, or ``default`` when bool/gap/≤0.
+
+    tradermonty #700/#655 + xang1234/portfolio AI: ``int(True)→1`` /
+    ``True*24→24h`` must not invent a 1-day Yahoo period or a 15m
+    from-buy span via ``float(days * 24)``.
+    """
+    from stock_checker.technical_indicators import coerce_nonneg_int
+
+    n = coerce_nonneg_int(value)
+    if n is None or n <= 0:
+        return int(default)
+    return n
+
+
+# Price / from-buy panel symbol ceilings — bare ``breakouts[:4]`` /
+# ``symbols[:8]`` / ``holdings[:10]`` lied when bool.
+PRICE_PANEL_BREAKOUT_CAP = 4
+PRICE_PANEL_SYMBOLS_CAP = 8
+FROM_BUY_PANEL_SYMBOLS_CAP = 10
+
+
+def _coerce_chart_symbol_cap(
+    value: object, default: int = PRICE_PANEL_SYMBOLS_CAP
+) -> int:
+    """Positive Charts panel symbol ceiling, or ``default`` when bool/gap/≤0.
+
+    tradermonty #700/#655 + xang1234/portfolio AI: ``True→1`` must not invent
+    a one-panel strip via ``breakouts[:True]`` / ``symbols[:True]``;
+    ``False→0`` must not wipe (listed-fund / short-refuse name-cap peers —
+    Charts still sliced bare ``[:4]`` / ``[:8]`` / ``[:10]``).
+    """
+    return _coerce_chart_days(value, default=default)
+
+
+def _coerce_chart_span_hours(value: object) -> float | None:
+    """Non-negative hold span hours, or None when bool/gap/NaN.
+
+    ``float(True)→1`` / ``True≤36`` must not invent a 15m bar size.
+    """
+    from stock_checker.technical_indicators import _finite_signed
+
+    if value is None or not _finite_signed(value):
+        return None
+    hours = float(value)  # type: ignore[arg-type]
+    if hours < 0.0:
+        return None
+    return hours
+
+
+def _coerce_chart_fetched_at(value: object) -> float | None:
+    """Finite epoch seconds for chart cache TTL, else None.
+
+    ``float(True or 0)→1`` / ``False→0`` must not invent a near-epoch
+    "fresh" hit or a cleared miss that looks intentional.
+    """
+    from stock_checker.technical_indicators import _finite_signed
+
+    if value is None or not _finite_signed(value):
+        return None
+    stamp = float(value)  # type: ignore[arg-type]
+    if stamp <= 0.0:
+        return None
+    return stamp
+
+
+def _yf_period_for(days: object, interval: str) -> str:
+    """yfinance period hints by bar size (intraday windows are short).
+
+    Bool/gap days fall back to 90 — never invent ``5d`` from ``True``.
+    """
+    n = _coerce_chart_days(days, default=90)
+    if interval in {"15m", "5m", "2m", "1m"}:
+        return "5d" if n <= 5 else "7d"
+    if interval in {"60m", "1h", "90m"}:
+        if n <= 7:
+            return "7d"
+        if n <= 30:
+            return "1mo"
+        return "3mo"
+    return "3mo" if n <= 100 else "6mo"
+
+
+def hold_chart_interval(span_hours: object, *, is_crypto: bool = False) -> str:
+    """
+    Pick bar size so short holds (esp. weekend crypto) are not a 2-point line.
+
+    Daily bars often have zero points between a morning fill and “now”.
+    Bool/gap span → ``1d`` — never invent ``15m`` from ``True≤36``.
+    """
+    hours = _coerce_chart_span_hours(span_hours)
+    if hours is None:
+        return "1d"
+    if hours <= 36:
+        return "15m"
+    if hours <= 72 or (is_crypto and hours <= 14 * 24):
+        return "1h"
+    return "1d"
+
+
+# Daily chart last-bar age (display only). Same bands as desk cash_print:
+# fresh <12h · aging <36h · else stale (weekend / missed session).
+# tradermonty #675 rejects stale daily bars before scoring — we speak only.
+CHART_BAR_FRESH_HOURS = 12
+CHART_BAR_AGING_HOURS = 36
+# Book-level aging|stale ownership of relative-price panels (display only).
+# Same hot/quiet bands as Screener junk share / Yahoo claim-drop share.
+CHART_BARS_SPOKEN_SHARE_HOT = 50.0
+CHART_BARS_SPOKEN_SHARE_QUIET = 25.0
+# Remaining fresh after spoken share (display only) — Screener ok / claim
+# vs-kept bands: strong ≥75% · thin <50%.
+CHART_BARS_FRESH_SHARE_STRONG = 75.0
+CHART_BARS_FRESH_SHARE_THIN = 50.0
+# spoken% − fresh% after severity lean (Mode A / short-refuse share Δ).
+CHART_SPOKEN_VS_FRESH_DELTA_WIDE_PP = 20.0
+CHART_SPOKEN_VS_FRESH_DELTA_THIN_PP = 10.0
+# aging% − stale% after severity lean (spoken/fresh share Δ parity; ``as Δ`` prefix).
+CHART_AGING_STALE_DELTA_WIDE_PP = 20.0
+CHART_AGING_STALE_DELTA_THIN_PP = 10.0
+
+
+def chart_price_bars_vs_fresh(
+    n_spoken: int,
+    n_fresh: int,
+    n_panels: int,
+) -> tuple[str, int | None, float | None, str]:
+    """Remaining fresh panels when spoken share already spoke (display only).
+
+    Spoken% alone hid usable fresh peers (Screener junk vs ok / Yahoo
+    claim-drop vs kept + portfolio AI speak-both-sides). Returns
+    ``(bit, fresh_n, fresh_pct, severity)``. Zero spoken → silent.
+    All-spoken → ``vs 0 fresh · thin · 0%``. ``strong`` ≥75% · ``thin``
+    <50% · mid shows the percent only.
+    """
+    spoken = _chart_count(n_spoken)
+    fresh = _chart_count(n_fresh)
+    panels = _chart_count(n_panels)
+    if spoken <= 0 or panels <= 0:
+        return "", None, None, ""
+    fresh = min(fresh, panels)
+    fresh_pct = round(100.0 * fresh / panels, 1)
+    if fresh_pct >= CHART_BARS_FRESH_SHARE_STRONG:
+        severity = "strong"
+        sev_bit = f"strong · {fresh_pct:g}%"
+    elif fresh_pct < CHART_BARS_FRESH_SHARE_THIN:
+        severity = "thin"
+        sev_bit = f"thin · {fresh_pct:g}%"
+    else:
+        severity = ""
+        sev_bit = f"{fresh_pct:g}%"
+    return f"vs {fresh} fresh · {sev_bit}", fresh, fresh_pct, severity
+
+
+def chart_price_bars_spoken_vs_fresh_lead(
+    n_spoken: int,
+    n_fresh: int,
+) -> tuple[str, str, int | None]:
+    """Strict lead among spoken vs fresh panel counts (display only).
+
+    Absolute ``N bars aging|stale`` beside ``vs M fresh`` hid which slot
+    owns the book (opportunity damaged vs ok lead / Yahoo claim-drop vs
+    live + portfolio AI count≠share + xang1234 multi-meter). Both sides
+    must be >0 and total ≥2; strict lead → ``lead spoken · N%`` /
+    ``lead fresh · N%``; ties / sole-side → silent (use
+    ``chart_price_bars_spoken_vs_fresh_sample_gap`` for ``spoken/fresh tied``).
+    """
+    spoken = _chart_count(n_spoken)
+    fresh = _chart_count(n_fresh)
+    total = spoken + fresh
+    if total < 2 or spoken <= 0 or fresh <= 0 or spoken == fresh:
+        return "", "", None
+    if spoken > fresh:
+        name, n = "spoken", spoken
+    else:
+        name, n = "fresh", fresh
+    share = int(round(100.0 * n / total))
+    return f"lead {name} · {share}%", name, share
+
+
+def chart_price_bars_spoken_vs_fresh_lead_size(
+    n_spoken: int,
+    n_fresh: int,
+    *,
+    lead_name: str = "",
+) -> tuple[float | None, int | None, int | None]:
+    """How many times louder owns quieter after spoken/fresh lead (display only).
+
+    When ``lead_name`` already spoke (``spoken|fresh``) and both counts are
+    >0, ``sf size · N×`` is louder÷quieter; zero quieter stays silent. Desk
+    names sides ``spoken|fresh N · fresh|spoken M`` (louder first; anonymous
+    louder/quieter dropped — Mode A / aging-stale named-sides parity). Prefixed
+    ``sf`` so aging/stale ``lead size`` stays unambiguous on the same lean.
+    Lead name/% ≠ magnitude (aging/stale lead size + portfolio AI count≠share).
+    Returns ``(size, louder_n, quieter_n)`` or all-None.
+    """
+    if str(lead_name or "").strip().casefold() not in {"spoken", "fresh"}:
+        return None, None, None
+    spoken = _chart_count(n_spoken)
+    fresh = _chart_count(n_fresh)
+    quieter = min(spoken, fresh)
+    louder = max(spoken, fresh)
+    if quieter <= 0:
+        return None, None, None
+    return round(louder / quieter, 2), louder, quieter
+
+
+def chart_price_bars_spoken_vs_fresh_lean(
+    spoken_severity: str,
+    fresh_severity: str,
+) -> tuple[str, bool]:
+    """Lean agreement of spoken vs fresh share bands (display only).
+
+    Absolute ``vs N fresh · strong|thin`` + ownership lead + sf size hid
+    whether the two *severity* bands agree (Mode A missing vs ready lean /
+    Screener junk vs ok / short-refuse vs long + portfolio AI
+    speak-both-sides + xang1234 severity). Align when ``hot|thin`` or
+    ``quiet|strong``; clash when exactly one lean spoke or the pair
+    disagrees. Adverse clash (spoken hot / fresh thin mismatch, or sole
+    hot/thin) warns. Mid both silent. Lives under the Charts bars lean
+    fold. Not a new entry gate.
+    """
+    spoken = str(spoken_severity or "").strip().casefold()
+    fresh = str(fresh_severity or "").strip().casefold()
+    spoken_lean = spoken in {"hot", "quiet"}
+    fresh_lean = fresh in {"strong", "thin"}
+    if spoken_lean and fresh_lean:
+        matched = (spoken == "hot" and fresh == "thin") or (
+            spoken == "quiet" and fresh == "strong"
+        )
+        if matched:
+            return f"spoken vs fresh align · {spoken}|{fresh}", False
+        return (
+            f"spoken vs fresh clash · spoken {spoken} · fresh {fresh}",
+            True,
+        )
+    if spoken_lean != fresh_lean:
+        spoken_label = spoken if spoken_lean else (spoken or "ok")
+        fresh_label = fresh if fresh_lean else (fresh or "ok")
+        warn = spoken == "hot" or fresh == "thin"
+        return (
+            f"spoken vs fresh clash · spoken {spoken_label} · "
+            f"fresh {fresh_label}",
+            warn,
+        )
+    return "", False
+
+
+def chart_price_bars_spoken_vs_fresh_delta(
+    spoken_share_pct: float | int | None,
+    fresh_share_pct: float | int | None,
+    *,
+    lean_bit: str = "",
+    wide_pp: float = CHART_SPOKEN_VS_FRESH_DELTA_WIDE_PP,
+    thin_pp: float = CHART_SPOKEN_VS_FRESH_DELTA_THIN_PP,
+) -> tuple[int | None, str, str, bool]:
+    """Share Δ after spoken vs fresh severity lean (display only).
+
+    Lean alone hid how far ``spoken% − fresh%`` sits (Mode A missing vs
+    ready / short-refuse vs long / Screener junk vs ok share Δ + portfolio
+    AI count≠spread + xang1234 severity). Requires lean already spoke.
+    Wide ≥``wide_pp`` · thin <``thin_pp`` · mid → ``lean vs Δ clash · lean
+    · Δ mid`` (warn). Adverse ``align · hot|thin`` + Δ wide warns;
+    ``quiet|strong`` stays calm.
+
+    Returns ``(delta_pp, delta_severity, lean_vs_delta, lean_vs_delta_warn)``.
+    Not a new entry gate.
+    """
+    if not str(lean_bit or "").strip():
+        return None, "", "", False
+    spoken = _chart_share(spoken_share_pct)
+    fresh = _chart_share(fresh_share_pct)
+    if spoken is None or fresh is None:
+        return None, "", "", False
+    raw = int(round(spoken - fresh))
+    abs_delta = abs(raw)
+    delta_sev = ""
+    if abs_delta >= wide_pp:
+        delta_sev = "wide"
+    elif abs_delta < thin_pp:
+        delta_sev = "thin"
+    if delta_sev:
+        lean_vs_delta = f"align · {delta_sev}"
+        lean_vs_delta_warn = delta_sev == "wide" and str(lean_bit).startswith(
+            "spoken vs fresh align · hot|thin"
+        )
+        return raw, delta_sev, lean_vs_delta, lean_vs_delta_warn
+    return raw, "", "clash · lean · Δ mid", True
+
+
+def chart_price_bars_spoken_vs_fresh_delta_lead(
+    delta_pp: int | None,
+    delta_severity: str,
+    *,
+    lean_vs_delta: str = "",
+) -> str:
+    """Name which slot owns a spoken vs fresh Δ (display only).
+
+    When lean vs Δ already spoke with a Δ (wide|thin) and ±pp ≠ 0,
+    positive ``spoken% − fresh%`` → ``spoken``; negative → ``fresh``.
+    Mid-Δ clash / 0pp stay silent. Signed pp alone hid which Charts
+    sleeve owns the spread (Mode A missing vs ready / short-refuse vs
+    long / Screener junk vs ok / opportunity damaged vs ok Δ lead +
+    portfolio AI speak-both-sides + xang1234). Returns ``spoken|fresh``
+    / ``\"\"``. Not a new entry gate.
+    """
+    if not str(lean_vs_delta or "").startswith("align ·"):
+        return ""
+    if str(delta_severity or "").strip().casefold() not in {"wide", "thin"}:
+        return ""
+    pp = _chart_delta_pp(delta_pp)
+    if pp is None or pp == 0:
+        return ""
+    return "spoken" if pp > 0 else "fresh"
+
+
+def chart_price_bars_spoken_vs_fresh_delta_lead_size(
+    spoken_share_pct: float | int | None,
+    fresh_share_pct: float | int | None,
+    *,
+    delta_lead: str = "",
+) -> tuple[float | None, float | None, float | None]:
+    """How many times louder owns quieter after spoken/fresh Δ lead.
+
+    When ``delta_lead`` already spoke (``spoken|fresh``) and both shares
+    are known, ``Δ lead size · N×`` is louder%÷quieter%; zero quieter
+    stays silent. Desk names sides ``spoken|fresh N% · fresh|spoken M%``
+    (louder first). Lead name ≠ magnitude (Mode A missing vs ready /
+    short-refuse / Screener / opportunity Δ lead size + portfolio AI
+    count≠share + xang1234). Returns ``(size, louder_pct, quieter_pct)``
+    or ``(None, None, None)``. Display only; not a new entry gate.
+    """
+    if str(delta_lead or "").strip().casefold() not in {"spoken", "fresh"}:
+        return None, None, None
+    spoken = _chart_share(spoken_share_pct)
+    fresh = _chart_share(fresh_share_pct)
+    if spoken is None or fresh is None:
+        return None, None, None
+    louder = max(spoken, fresh)
+    quieter = min(spoken, fresh)
+    if quieter <= 0:
+        return None, None, None
+    return round(louder / quieter, 2), louder, quieter
+
+
+def chart_price_bars_spoken_vs_fresh_sample_gap(
+    n_spoken: int,
+    n_fresh: int,
+) -> str:
+    """Speak ``spoken/fresh tied`` when both sides spoke with no strict lead.
+
+    Prefixed so the bit stays distinct from ``aging/stale tied``. Lead /
+    sole-side / zero stay silent. Display only.
+    """
+    spoken = _chart_count(n_spoken)
+    fresh = _chart_count(n_fresh)
+    if spoken <= 0 or fresh <= 0:
+        return ""
+    lead_bit, _name, _share = chart_price_bars_spoken_vs_fresh_lead(
+        spoken, fresh
+    )
+    if lead_bit:
+        return ""
+    return "spoken/fresh tied"
+
+
+def chart_last_bar_meta(
+    points: list[dict[str, Any]],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Last daily close age band for chart honesty (display only).
+
+    Scan/Yahoo cache age ≠ whether the plotted close is a completed session.
+    Missing/unparseable stamps stay silent.
+    """
+    empty: dict[str, Any] = {
+        "last_bar": "",
+        "bar_age_sec": None,
+        "bar_freshness": "",
+        "bar_age_label": "",
+    }
+    if not points:
+        return empty
+    ts = _parse_trade_ts(str(points[-1].get("t") or ""))
+    if ts is None:
+        return empty
+    clock = now or datetime.now(timezone.utc)
+    age = max(0.0, (clock - ts).total_seconds())
+    if age < CHART_BAR_FRESH_HOURS * 3600:
+        band = "fresh"
+    elif age < CHART_BAR_AGING_HOURS * 3600:
+        band = "aging"
+    else:
+        band = "stale"
+    if age < 3600:
+        label = f"{int(age // 60)}m ago"
+    elif age < 36 * 3600:
+        label = f"{int(age // 3600)}h ago"
+    else:
+        label = f"{int(age // 86400)}d ago"
+    return {
+        "last_bar": ts.strftime("%Y-%m-%d"),
+        "bar_age_sec": int(age),
+        "bar_freshness": band,
+        "bar_age_label": label,
+    }
+
+
+def chart_price_bars_aging_stale_lead(
+    n_aging: int,
+    n_stale: int,
+) -> tuple[str, str, int | None]:
+    """Strict lead among aging vs stale spoken bars (display only).
+
+    Absolute ``N aging · M stale`` hid which band owns the spoken set
+    (Yahoo claim-drop dead/stale lead + portfolio AI count≠share +
+    xang1234 multi-meter). Both sides must be >0 and total ≥2; strict lead
+    → ``lead stale · N%`` / ``lead aging · N%``; ties / sole-side → silent
+    (use ``chart_price_bars_aging_stale_sample_gap`` for ``aging/stale tied``).
+    """
+    aging = _chart_count(n_aging)
+    stale = _chart_count(n_stale)
+    total = aging + stale
+    if total < 2 or aging <= 0 or stale <= 0 or aging == stale:
+        return "", "", None
+    if stale > aging:
+        name, n = "stale", stale
+    else:
+        name, n = "aging", aging
+    share = int(round(100.0 * n / total))
+    return f"lead {name} · {share}%", name, share
+
+
+def chart_price_bars_aging_stale_sample_gap(
+    n_aging: int,
+    n_stale: int,
+) -> str:
+    """Speak ``aging/stale tied`` when both bands spoke with no strict lead.
+
+    Prefixed so the bit stays distinct from other glance ``tied`` chips.
+    Lead / sole-side / zero stay silent. Display only.
+    """
+    aging = _chart_count(n_aging)
+    stale = _chart_count(n_stale)
+    if aging <= 0 or stale <= 0:
+        return ""
+    lead_bit, _name, _share = chart_price_bars_aging_stale_lead(aging, stale)
+    if lead_bit:
+        return ""
+    return "aging/stale tied"
+
+
+def chart_price_bars_aging_stale_lead_size(
+    n_aging: int,
+    n_stale: int,
+    *,
+    lead_name: str = "",
+) -> tuple[float | None, int | None, int | None]:
+    """How many times louder owns quieter after aging/stale lead (display only).
+
+    When ``lead_name`` already spoke (``aging|stale``) and both counts are
+    >0, ``lead size · N×`` is louder÷quieter; zero quieter stays silent.
+    Desk names sides ``aging|stale N · stale|aging M`` (louder first;
+    anonymous louder/quieter dropped — Mode A / Screener / opportunity
+    named-sides parity). Lead name/% ≠ magnitude (opportunity / Screener
+    Δ lead size + portfolio AI count≠share). Returns
+    ``(size, louder_n, quieter_n)`` or all-None.
+    """
+    if str(lead_name or "").strip().casefold() not in {"aging", "stale"}:
+        return None, None, None
+    aging = _chart_count(n_aging)
+    stale = _chart_count(n_stale)
+    quieter = min(aging, stale)
+    louder = max(aging, stale)
+    if quieter <= 0:
+        return None, None, None
+    return round(louder / quieter, 2), louder, quieter
+
+
+def chart_price_bars_aging_stale_share_bands(
+    n_aging: int,
+    n_stale: int,
+    *,
+    hot: float = CHART_BARS_SPOKEN_SHARE_HOT,
+    quiet: float = CHART_BARS_SPOKEN_SHARE_QUIET,
+) -> tuple[float | None, str, float | None, str]:
+    """Per-band ownership of spoken aging|stale bars (display only).
+
+    Absolute sides + lead + size hid whether aging vs stale *share* of
+    spoken is extreme (postmortem skip-reason share bands / Screener junk
+    share + portfolio AI count≠share + xang1234). Both sides must be >0;
+    sole-side / zero → silent. Returns
+    ``(aging_pct, aging_sev, stale_pct, stale_sev)`` with ``hot|quiet|\"\"``.
+    Not a new entry gate.
+    """
+    aging = _chart_count(n_aging)
+    stale = _chart_count(n_stale)
+    total = aging + stale
+    if total <= 0 or aging <= 0 or stale <= 0:
+        return None, "", None, ""
+    aging_pct = round(100.0 * aging / total)
+    stale_pct = round(100.0 * stale / total)
+
+    def _sev(pct: float) -> str:
+        if pct >= hot:
+            return "hot"
+        if pct <= quiet:
+            return "quiet"
+        return ""
+
+    return aging_pct, _sev(aging_pct), stale_pct, _sev(stale_pct)
+
+
+def chart_price_bars_aging_stale_lean(
+    aging_severity: str,
+    stale_severity: str,
+) -> tuple[str, bool]:
+    """Lean agreement of aging vs stale spoken-share bands (display only).
+
+    Absolute sides + ownership lead + lead size hid whether the two
+    *severity* bands agree (postmortem skip-reason lean / Screener junk vs
+    ok lean + portfolio AI speak-both-sides + xang1234 severity). Both
+    sides use ``hot|quiet`` of spoken. Align when complementary
+    ``hot|quiet`` / ``quiet|hot``; clash when exactly one lean spoke or
+    both hot (e.g. 50/50). Adverse clash (any ``hot``) warns. Mid both
+    silent. Lives under the Charts bars lean fold. Not a new entry gate.
+    """
+    a = str(aging_severity or "").strip().casefold()
+    s = str(stale_severity or "").strip().casefold()
+    a_lean = a in {"hot", "quiet"}
+    s_lean = s in {"hot", "quiet"}
+    if a_lean and s_lean:
+        complementary = (a == "hot" and s == "quiet") or (
+            a == "quiet" and s == "hot"
+        )
+        if complementary:
+            return f"aging vs stale align · {a}|{s}", False
+        return (
+            f"aging vs stale clash · aging {a} · stale {s}",
+            True,
+        )
+    if a_lean != s_lean:
+        a_label = a if a_lean else (a or "ok")
+        s_label = s if s_lean else (s or "ok")
+        warn = a == "hot" or s == "hot"
+        return (
+            f"aging vs stale clash · aging {a_label} · stale {s_label}",
+            warn,
+        )
+    return "", False
+
+
+def chart_price_bars_aging_stale_delta(
+    aging_share_pct: float | int | None,
+    stale_share_pct: float | int | None,
+    *,
+    lean_bit: str = "",
+    wide_pp: float = CHART_AGING_STALE_DELTA_WIDE_PP,
+    thin_pp: float = CHART_AGING_STALE_DELTA_THIN_PP,
+) -> tuple[int | None, str, str, bool]:
+    """Share Δ after aging vs stale severity lean (display only).
+
+    Lean alone hid how far ``aging% − stale%`` sits (spoken vs fresh /
+    Mode A missing vs ready / Screener junk vs ok share Δ + portfolio AI
+    count≠spread + xang1234 severity). Requires lean already spoke.
+    Wide ≥``wide_pp`` · thin <``thin_pp`` · mid → ``clash · lean · Δ mid``
+    (warn). Complementary ``align · hot|quiet`` / ``quiet|hot`` stay calm
+    even when Δ is wide (no adverse hot|thin band pair on this sleeve).
+    Desk bits use ``as Δ`` / ``as lean vs Δ`` so spoken/fresh ``Δ`` /
+    ``lean vs Δ`` on the same Charts fold stay unambiguous.
+
+    Returns ``(delta_pp, delta_severity, lean_vs_delta, lean_vs_delta_warn)``.
+    Not a new entry gate.
+    """
+    if not str(lean_bit or "").strip():
+        return None, "", "", False
+    aging = _chart_share(aging_share_pct)
+    stale = _chart_share(stale_share_pct)
+    if aging is None or stale is None:
+        return None, "", "", False
+    raw = int(round(aging - stale))
+    abs_delta = abs(raw)
+    delta_sev = ""
+    if abs_delta >= wide_pp:
+        delta_sev = "wide"
+    elif abs_delta < thin_pp:
+        delta_sev = "thin"
+    if delta_sev:
+        # Complementary hot|quiet stays calm; mid-Δ clash is the only warn.
+        return raw, delta_sev, f"align · {delta_sev}", False
+    return raw, "", "clash · lean · Δ mid", True
+
+
+def chart_price_bars_aging_stale_delta_lead(
+    delta_pp: int | None,
+    delta_severity: str,
+    *,
+    lean_vs_delta: str = "",
+) -> str:
+    """Name which slot owns an aging vs stale Δ (display only).
+
+    When ``as lean vs Δ`` already spoke with a Δ (wide|thin) and ±pp ≠ 0,
+    positive ``aging% − stale%`` → ``aging``; negative → ``stale``.
+    Mid-Δ clash / 0pp stay silent. Desk bits use ``as Δ lead · aging|stale``
+    so spoken/fresh ``Δ lead`` on the same Charts fold stays unambiguous.
+    Signed pp alone hid which spoken-band sleeve owns the spread (spoken
+    vs fresh / Mode A missing vs ready / Screener junk vs ok Δ lead +
+    portfolio AI speak-both-sides + xang1234). Returns ``aging|stale`` /
+    ``\"\"``. Not a new entry gate.
+    """
+    if not str(lean_vs_delta or "").startswith("align ·"):
+        return ""
+    if str(delta_severity or "").strip().casefold() not in {"wide", "thin"}:
+        return ""
+    pp = _chart_delta_pp(delta_pp)
+    if pp is None or pp == 0:
+        return ""
+    return "aging" if pp > 0 else "stale"
+
+
+def chart_price_bars_aging_stale_delta_lead_size(
+    aging_share_pct: float | int | None,
+    stale_share_pct: float | int | None,
+    *,
+    delta_lead: str = "",
+) -> tuple[float | None, float | None, float | None]:
+    """How many times louder owns quieter after aging/stale Δ lead.
+
+    When ``delta_lead`` already spoke (``aging|stale``) and both shares
+    are known, ``as Δ lead size · N×`` is louder%÷quieter%; zero quieter
+    stays silent. Desk names sides ``aging|stale N% · stale|aging M%``
+    (louder first; ``as`` prefix keeps spoken/fresh ``Δ lead size``
+    unambiguous). Lead name ≠ magnitude (spoken vs fresh / Mode A /
+    Screener / opportunity Δ lead size + portfolio AI count≠share +
+    xang1234). Returns ``(size, louder_pct, quieter_pct)`` or
+    ``(None, None, None)``. Display only; not a new entry gate.
+    """
+    if str(delta_lead or "").strip().casefold() not in {"aging", "stale"}:
+        return None, None, None
+    aging = _chart_share(aging_share_pct)
+    stale = _chart_share(stale_share_pct)
+    if aging is None or stale is None:
+        return None, None, None
+    louder = max(aging, stale)
+    quieter = min(aging, stale)
+    if quieter <= 0:
+        return None, None, None
+    return round(louder / quieter, 2), louder, quieter
+
+
+def chart_price_bars_delta_lead_size_moods(
+    spoken_fresh_size: float | int | None,
+    aging_stale_size: float | int | None,
+) -> tuple[str, bool]:
+    """Spoken/fresh vs aging/stale Δ lead size mood (display only).
+
+    When both ``Δ lead size · N×`` (spoken|fresh) and ``as Δ lead size ·
+    M×`` (aging|stale) already spoke: same → ``align · both N×``;
+    crossed → ``clash · spoken/fresh N× · aging/stale M×``. Missing
+    either silent. Dual fat (≥2×) + clash warn; equal thin calm. Side-
+    by-side magnitudes alone hid whether ownership spreads agree
+    (Mode A race vs mix / soft-allow short / Screener junk/unique /
+    Window A fill vs close Δ lead size moods + portfolio AI count≠share
+    + xang1234). Prefixed ``Δ size moods`` in the lean fold so ``Δ size``
+    + ``as Δ size`` stay distinct. Not a new entry gate.
+    """
+    sf_f = _chart_share(spoken_fresh_size)
+    as_f = _chart_share(aging_stale_size)
+    if sf_f is None or as_f is None:
+        return "", False
+    sf_s = f"{sf_f:g}"
+    as_s = f"{as_f:g}"
+    if abs(sf_f - as_f) < 1e-9:
+        return f"align · both {sf_s}×", sf_f >= 2.0
+    return (
+        f"clash · spoken/fresh {sf_s}× · aging/stale {as_s}×",
+        True,
+    )
+
+
+# Quiet price-bars lean chip names spoken stages (Screener / pin lean inventory).
+# Longer prefixes first so ``sf size sides`` ≠ ``sf size`` / ``Δ lead size sides``
+# ≠ ``Δ lead size`` ≠ ``Δ lead`` / ``Δ size moods`` ≠ ``Δ`` /
+# ``lead size sides`` ≠ ``lead size`` / ``as lean vs Δ`` ≠ ``aging vs stale`` /
+# ``as Δ lead size sides`` ≠ ``as Δ lead size`` ≠ ``as Δ lead`` ≠ ``as Δ`` /
+# ``aging vs stale`` ≠ ``aging/stale tied``.
+_PRICE_BARS_LEAN_NAME_CAP = 4
+_PRICE_BARS_LEAN_STAGE_RES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^vs \d+ fresh\b"), "vs fresh"),
+    (re.compile(r"^spoken/fresh tied\b"), "sf tied"),
+    (re.compile(r"^sf size sides\b"), "sf sides"),
+    (re.compile(r"^sf size\b"), "sf size"),
+    (re.compile(r"^spoken vs fresh align\b"), "sf lean"),
+    (re.compile(r"^spoken vs fresh clash\b"), "sf lean"),
+    (re.compile(r"^lean vs Δ\b"), "lean"),
+    (re.compile(r"^Δ lead size sides\b"), "Δ sides"),
+    (re.compile(r"^Δ lead size\b"), "Δ size"),
+    (re.compile(r"^Δ lead\b"), "Δ lead"),
+    (re.compile(r"^Δ size moods\b"), "Δ size moods"),
+    (re.compile(r"^Δ (?:wide|thin)\b"), "Δ"),
+    (re.compile(r"^lead spoken\b"), "spoken"),
+    (re.compile(r"^lead fresh\b"), "fresh lead"),
+    (re.compile(r"^as lean vs Δ\b"), "as lean/Δ"),
+    (re.compile(r"^as Δ lead size sides\b"), "as Δ sides"),
+    (re.compile(r"^as Δ lead size\b"), "as Δ size"),
+    (re.compile(r"^as Δ lead\b"), "as Δ lead"),
+    (re.compile(r"^as Δ\b"), "as Δ"),
+    (re.compile(r"^aging vs stale align\b"), "as lean"),
+    (re.compile(r"^aging vs stale clash\b"), "as lean"),
+    (re.compile(r"^aging/stale tied\b"), "as tied"),
+    (re.compile(r"^lead size sides\b"), "sides"),
+    (re.compile(r"^lead size\b"), "size"),
+    (re.compile(r"^lead stale\b"), "stale"),
+    (re.compile(r"^lead aging\b"), "aging"),
+)
+
+
+def chart_price_bars_lean_meta(lean: str, *, warn: bool = False) -> str:
+    """Summary chip for Charts price-bars lean fold (display only).
+
+    Quiet names stages that spoke (``quiet · N folds · vs fresh · spoken ·
+    size``) so bare ``quiet`` does not claim lead/size when those bits are
+    absent — Screener weight / opportunity pin lean meta + MonsterDeveloper
+    fold inventory after ownership cascade hid the ladder. Warned folds speak
+    ``warn`` and append the clipped stages. Not a gate.
+    """
+    from stock_checker.yahoo_universe_discovery import _quiet_inventory_chip
+
+    text = str(lean or "").strip()
+    if not text:
+        return "quiet"
+    if warn:
+        stage_tail = _quiet_inventory_chip(
+            text,
+            _PRICE_BARS_LEAN_STAGE_RES,
+            cap=_PRICE_BARS_LEAN_NAME_CAP,
+            quiet=False,
+        )
+        if stage_tail:
+            return f"warn · {stage_tail}"
+        return "warn"
+    return _quiet_inventory_chip(
+        text, _PRICE_BARS_LEAN_STAGE_RES, cap=_PRICE_BARS_LEAN_NAME_CAP
+    )
+
+
+def chart_price_bars_glance(
+    panels: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """Book-level last-bar aging|stale after per-legend bits (display only).
+
+    Absolute ``N bars stale`` alone hid one hung panel vs most of the relative
+    book — speak ownership share (portfolio AI count≠share + xang1234 multi-meter).
+    When spoken share already spoke, also speak ``vs N fresh · [strong|thin] ·
+    P%`` so spoken% ≠ silent empty fresh peers (Screener junk vs ok / Yahoo
+    claim-drop vs kept). When vs-fresh already spoke and both spoken + fresh
+    counts are >0, also speak ``lead spoken|fresh · N%`` or
+    ``spoken/fresh tied`` so absolute sides ≠ silent book ownership. After a
+    strict spoken/fresh lead, also speak ``sf size · N×`` + named
+    ``sf size sides · spoken|fresh N · fresh|spoken M`` (louder first; ``sf``
+    prefix keeps aging/stale ``lead size`` unambiguous) so name/% ≠ magnitude.
+    When spoken + fresh share severity bands already spoke, also speak
+    ``spoken vs fresh align · hot|thin`` / ``quiet|strong`` or clash so
+    sides/lead/size alone do not hide severity agreement (Mode A / Screener
+    / short-refuse lean parity). When lean already spoke, also speak
+    ``Δ wide|thin · ±Npp`` + ``lean vs Δ align · wide|thin`` /
+    ``clash · lean · Δ mid`` so lean alone does not hide spoken%−fresh%
+    spread (Mode A / short-refuse share Δ). When lean vs Δ already spoke
+    with a non-zero wide|thin Δ, also speak ``Δ lead · spoken|fresh`` so
+    signed ±pp alone does not hide which Charts sleeve owns the spread
+    (Mode A / short-refuse / Screener / opportunity Δ lead). When Δ lead
+    already spoke and quieter% > 0, also speak ``Δ lead size · N×`` +
+    named ``Δ lead size sides · spoken|fresh N% · fresh|spoken M%``
+    (louder first) so lead name alone does not hide magnitude (Mode A /
+    short-refuse / Screener / opportunity Δ lead size). When both aging
+    and stale spoke, also speak ``lead stale|aging · N%`` or
+    ``aging/stale tied`` so absolute sides ≠ silent ownership. After a
+    strict aging/stale lead, also speak ``lead size · N×`` + named
+    ``lead size sides · aging|stale N · stale|aging M`` (louder first) so
+    name/% ≠ magnitude and anonymous louder/quieter does not hide which
+    spoken-band sleeve owns quieter. When aging + stale share severity
+    bands already spoke, also speak ``aging vs stale align · hot|quiet``
+    / clash so sides/lead/size alone do not hide severity agreement
+    (postmortem skip-reason lean / Screener junk vs ok + portfolio AI
+    speak-both-sides + xang1234). When aging vs stale lean already spoke,
+    also speak ``as Δ wide|thin · ±Npp`` + ``as lean vs Δ align · wide|thin``
+    / ``clash · lean · Δ mid`` so lean alone does not hide aging%−stale%
+    spread (``as`` prefix keeps spoken/fresh ``Δ`` unambiguous on the same
+    fold — Mode A / spoken vs fresh share Δ parity). When as lean vs Δ
+    already spoke with a non-zero wide|thin Δ, also speak
+    ``as Δ lead · aging|stale`` so signed ±pp alone does not hide which
+    spoken-band sleeve owns the spread.     When as Δ lead already spoke and
+    quieter% > 0, also speak ``as Δ lead size · N×`` + named
+    ``as Δ lead size sides · aging|stale N% · stale|aging M%`` (louder
+    first; ``as`` prefix keeps spoken/fresh ``Δ lead size`` unambiguous)
+    so lead name alone does not hide magnitude (spoken vs fresh / Mode A /
+    Screener / opportunity Δ lead size). When both spoken/fresh + aging/
+    stale Δ lead sizes already spoke, also speak ``Δ size moods align ·
+    both N×`` / ``clash · spoken/fresh N× · aging/stale M×`` so matching
+    Δ lead polarity cannot hide 3× vs 2× ownership spreads across the two
+    Charts meters (Mode A race vs mix / soft-allow short / Screener /
+    Window A fill vs close Δ lead size moods + portfolio AI count≠share
+    + xang1234). Ownership/lead cascade sits in ``lean`` under a Charts
+    fold (MonsterDeveloper weight/sleeve lean parity — share alone hid
+    vs-fresh / lead / size); ``lean_meta`` names spoken stages. Full
+    ``bit`` stays joined for tests. Zero spoken stays silent. Not a
+    scoring veto / not a new entry gate.
+    """
+    empty: dict[str, Any] = {
+        "ready": False,
+        "bit": "",
+        "bit_core": "",
+        "line": "",
+        "lean": "",
+        "lean_warn": False,
+        "lean_meta": "quiet",
+        "tone": "flat",
+        "n_panels": 0,
+        "n_fresh": 0,
+        "n_aging": 0,
+        "n_stale": 0,
+        "n_spoken": 0,
+        "spoken_share_pct": None,
+        "spoken_share_severity": "",
+        "vs_fresh": "",
+        "vs_fresh_n": None,
+        "vs_fresh_share_pct": None,
+        "vs_fresh_severity": "",
+        "spoken_vs_fresh_lead": "",
+        "spoken_vs_fresh_lead_name": "",
+        "spoken_vs_fresh_lead_share_pct": None,
+        "spoken_vs_fresh_sample_gap": "",
+        "spoken_vs_fresh_lead_size": None,
+        "spoken_vs_fresh_lead_size_louder": None,
+        "spoken_vs_fresh_lead_size_quieter": None,
+        "spoken_vs_fresh_lean": "",
+        "spoken_vs_fresh_lean_warn": False,
+        "spoken_vs_fresh_delta_pp": None,
+        "spoken_vs_fresh_delta_severity": "",
+        "spoken_vs_fresh_lean_vs_delta": "",
+        "spoken_vs_fresh_lean_vs_delta_warn": False,
+        "spoken_vs_fresh_delta_lead": "",
+        "spoken_vs_fresh_delta_lead_size": None,
+        "spoken_vs_fresh_delta_lead_size_louder": None,
+        "spoken_vs_fresh_delta_lead_size_quieter": None,
+        "aging_stale_lead": "",
+        "aging_stale_lead_name": "",
+        "aging_stale_lead_share_pct": None,
+        "aging_stale_sample_gap": "",
+        "aging_stale_lead_size": None,
+        "aging_stale_lead_size_louder": None,
+        "aging_stale_lead_size_quieter": None,
+        "aging_share_pct": None,
+        "aging_share_severity": "",
+        "stale_share_pct": None,
+        "stale_share_severity": "",
+        "aging_stale_lean": "",
+        "aging_stale_lean_warn": False,
+        "aging_stale_delta_pp": None,
+        "aging_stale_delta_severity": "",
+        "aging_stale_lean_vs_delta": "",
+        "aging_stale_lean_vs_delta_warn": False,
+        "aging_stale_delta_lead": "",
+        "aging_stale_delta_lead_size": None,
+        "aging_stale_delta_lead_size_louder": None,
+        "aging_stale_delta_lead_size_quieter": None,
+        "delta_lead_size_moods": "",
+        "delta_lead_size_moods_warn": False,
+    }
+    if not isinstance(panels, list) or not panels:
+        return empty
+    n_fresh = n_aging = n_stale = 0
+    for p in panels:
+        if not isinstance(p, dict):
+            continue
+        band = str(p.get("bar_freshness") or "")
+        if band == "fresh":
+            n_fresh += 1
+        elif band == "aging":
+            n_aging += 1
+        elif band == "stale":
+            n_stale += 1
+    n_panels = n_fresh + n_aging + n_stale
+    n_spoken = n_aging + n_stale
+    if n_panels <= 0 or n_spoken <= 0:
+        return {**empty, "n_panels": n_panels, "n_fresh": n_fresh}
+    if n_aging and n_stale:
+        count_bit = f"{n_aging} aging · {n_stale} stale"
+    elif n_stale:
+        count_bit = f"{n_stale} bars stale"
+    else:
+        count_bit = f"{n_aging} bars aging"
+    spoken_share_pct = round(100.0 * n_spoken / n_panels, 1)
+    if spoken_share_pct >= CHART_BARS_SPOKEN_SHARE_HOT:
+        spoken_share_severity = "hot"
+        share_bit = f"hot · {spoken_share_pct:g}%"
+    elif spoken_share_pct <= CHART_BARS_SPOKEN_SHARE_QUIET:
+        spoken_share_severity = "quiet"
+        share_bit = f"quiet · {spoken_share_pct:g}%"
+    else:
+        spoken_share_severity = ""
+        share_bit = f"{spoken_share_pct:g}%"
+    vs_fresh_bit, vs_fresh_n, vs_fresh_pct, vs_fresh_sev = (
+        chart_price_bars_vs_fresh(n_spoken, n_fresh, n_panels)
+    )
+    sf_lead_bit, sf_lead_name, sf_lead_share = (
+        chart_price_bars_spoken_vs_fresh_lead(n_spoken, n_fresh)
+        if vs_fresh_bit
+        else ("", "", None)
+    )
+    sf_sample_gap = (
+        chart_price_bars_spoken_vs_fresh_sample_gap(n_spoken, n_fresh)
+        if vs_fresh_bit
+        else ""
+    )
+    sf_size, sf_louder_n, sf_quieter_n = (
+        chart_price_bars_spoken_vs_fresh_lead_size(
+            n_spoken, n_fresh, lead_name=sf_lead_name
+        )
+        if sf_lead_bit
+        else (None, None, None)
+    )
+    sf_lean_bit, sf_lean_warn = chart_price_bars_spoken_vs_fresh_lean(
+        spoken_share_severity, vs_fresh_sev
+    )
+    (
+        sf_delta_pp,
+        sf_delta_sev,
+        sf_lean_vs_delta,
+        sf_lean_vs_delta_warn,
+    ) = (
+        chart_price_bars_spoken_vs_fresh_delta(
+            spoken_share_pct,
+            vs_fresh_pct,
+            lean_bit=sf_lean_bit,
+        )
+        if sf_lean_bit
+        else (None, "", "", False)
+    )
+    sf_delta_lead = (
+        chart_price_bars_spoken_vs_fresh_delta_lead(
+            sf_delta_pp,
+            sf_delta_sev,
+            lean_vs_delta=sf_lean_vs_delta,
+        )
+        if sf_lean_vs_delta
+        else ""
+    )
+    sf_d_size, sf_d_louder, sf_d_quieter = (
+        chart_price_bars_spoken_vs_fresh_delta_lead_size(
+            spoken_share_pct,
+            vs_fresh_pct,
+            delta_lead=sf_delta_lead,
+        )
+        if sf_delta_lead
+        else (None, None, None)
+    )
+    lead_bit, lead_name, lead_share = chart_price_bars_aging_stale_lead(
+        n_aging, n_stale
+    )
+    sample_gap = chart_price_bars_aging_stale_sample_gap(n_aging, n_stale)
+    size, louder_n, quieter_n = chart_price_bars_aging_stale_lead_size(
+        n_aging, n_stale, lead_name=lead_name
+    )
+    (
+        aging_share_pct,
+        aging_share_sev,
+        stale_share_pct,
+        stale_share_sev,
+    ) = chart_price_bars_aging_stale_share_bands(n_aging, n_stale)
+    as_lean_bit, as_lean_warn = chart_price_bars_aging_stale_lean(
+        aging_share_sev, stale_share_sev
+    )
+    (
+        as_delta_pp,
+        as_delta_sev,
+        as_lean_vs_delta,
+        as_lean_vs_delta_warn,
+    ) = chart_price_bars_aging_stale_delta(
+        aging_share_pct,
+        stale_share_pct,
+        lean_bit=as_lean_bit,
+    )
+    as_delta_lead = (
+        chart_price_bars_aging_stale_delta_lead(
+            as_delta_pp,
+            as_delta_sev,
+            lean_vs_delta=as_lean_vs_delta,
+        )
+        if as_lean_vs_delta
+        else ""
+    )
+    as_d_size, as_d_louder, as_d_quieter = (
+        chart_price_bars_aging_stale_delta_lead_size(
+            aging_share_pct,
+            stale_share_pct,
+            delta_lead=as_delta_lead,
+        )
+        if as_delta_lead
+        else (None, None, None)
+    )
+    size_moods, size_moods_warn = chart_price_bars_delta_lead_size_moods(
+        sf_d_size, as_d_size
+    )
+    own_bit = lead_bit or sample_gap
+    sf_own = sf_lead_bit or sf_sample_gap
+    bit_core = f"{count_bit} · {share_bit}"
+    lean_parts: list[str] = []
+    if vs_fresh_bit:
+        lean_parts.append(vs_fresh_bit)
+    if sf_own:
+        lean_parts.append(sf_own)
+    if (
+        sf_size is not None
+        and sf_louder_n is not None
+        and sf_quieter_n is not None
+        and sf_lead_name
+    ):
+        sf_other = "fresh" if sf_lead_name == "spoken" else "spoken"
+        lean_parts.append(f"sf size · {sf_size:g}×")
+        lean_parts.append(
+            f"sf size sides · {sf_lead_name} {sf_louder_n} · "
+            f"{sf_other} {sf_quieter_n}"
+        )
+    if sf_lean_bit:
+        lean_parts.append(sf_lean_bit)
+    if sf_delta_sev and sf_delta_pp is not None:
+        signed = f"+{sf_delta_pp}" if sf_delta_pp > 0 else f"{sf_delta_pp}"
+        lean_parts.append(f"Δ {sf_delta_sev} · {signed}pp")
+    if sf_lean_vs_delta:
+        lean_parts.append(f"lean vs Δ {sf_lean_vs_delta}")
+    if sf_delta_lead:
+        lean_parts.append(f"Δ lead · {sf_delta_lead}")
+    if (
+        sf_d_size is not None
+        and sf_d_louder is not None
+        and sf_d_quieter is not None
+        and sf_delta_lead
+    ):
+        sf_d_other = "fresh" if sf_delta_lead == "spoken" else "spoken"
+        lean_parts.append(f"Δ lead size · {sf_d_size:g}×")
+        lean_parts.append(
+            f"Δ lead size sides · {sf_delta_lead} {sf_d_louder:g}% · "
+            f"{sf_d_other} {sf_d_quieter:g}%"
+        )
+    if own_bit:
+        lean_parts.append(own_bit)
+    if size is not None and louder_n is not None and quieter_n is not None:
+        other = "stale" if lead_name == "aging" else "aging"
+        lean_parts.append(f"lead size · {size:g}×")
+        lean_parts.append(
+            f"lead size sides · {lead_name} {louder_n} · {other} {quieter_n}"
+        )
+    if as_lean_bit:
+        lean_parts.append(as_lean_bit)
+    if as_delta_sev and as_delta_pp is not None:
+        as_signed = f"+{as_delta_pp}" if as_delta_pp > 0 else f"{as_delta_pp}"
+        lean_parts.append(f"as Δ {as_delta_sev} · {as_signed}pp")
+    if as_lean_vs_delta:
+        lean_parts.append(f"as lean vs Δ {as_lean_vs_delta}")
+    if as_delta_lead:
+        lean_parts.append(f"as Δ lead · {as_delta_lead}")
+    if (
+        as_d_size is not None
+        and as_d_louder is not None
+        and as_d_quieter is not None
+        and as_delta_lead
+    ):
+        as_d_other = "stale" if as_delta_lead == "aging" else "aging"
+        lean_parts.append(f"as Δ lead size · {as_d_size:g}×")
+        lean_parts.append(
+            f"as Δ lead size sides · {as_delta_lead} {as_d_louder:g}% · "
+            f"{as_d_other} {as_d_quieter:g}%"
+        )
+    if size_moods:
+        lean_parts.append(f"Δ size moods {size_moods}")
+    lean = " · ".join(lean_parts)
+    bit = f"{bit_core} · {lean}" if lean else bit_core
+    tone = "flat"
+    if n_stale or spoken_share_severity == "hot":
+        tone = "warn"
+    elif n_aging:
+        tone = "aging"
+    # Thin fresh remainder escalates warn when share was already hot/aging.
+    if vs_fresh_sev == "thin" and tone == "flat":
+        tone = "aging"
+    if sf_lean_warn and tone == "flat":
+        tone = "aging"
+    if sf_lean_vs_delta_warn and tone == "flat":
+        tone = "aging"
+    if as_lean_warn and tone == "flat":
+        tone = "aging"
+    if as_lean_vs_delta_warn and tone == "flat":
+        tone = "aging"
+    if size_moods_warn and tone == "flat":
+        tone = "aging"
+    lean_warn = (
+        tone == "warn"
+        or sf_lean_warn
+        or sf_lean_vs_delta_warn
+        or as_lean_warn
+        or as_lean_vs_delta_warn
+        or size_moods_warn
+    )
+    return {
+        "ready": True,
+        "bit": bit,
+        "bit_core": bit_core,
+        "line": bit_core,
+        "lean": lean,
+        "lean_warn": lean_warn,
+        "lean_meta": chart_price_bars_lean_meta(lean, warn=lean_warn),
+        "tone": tone,
+        "n_panels": n_panels,
+        "n_fresh": n_fresh,
+        "n_aging": n_aging,
+        "n_stale": n_stale,
+        "n_spoken": n_spoken,
+        "spoken_share_pct": spoken_share_pct,
+        "spoken_share_severity": spoken_share_severity,
+        "vs_fresh": vs_fresh_bit,
+        "vs_fresh_n": vs_fresh_n,
+        "vs_fresh_share_pct": vs_fresh_pct,
+        "vs_fresh_severity": vs_fresh_sev,
+        "spoken_vs_fresh_lead": sf_lead_bit,
+        "spoken_vs_fresh_lead_name": sf_lead_name,
+        "spoken_vs_fresh_lead_share_pct": sf_lead_share,
+        "spoken_vs_fresh_sample_gap": sf_sample_gap,
+        "spoken_vs_fresh_lead_size": sf_size,
+        "spoken_vs_fresh_lead_size_louder": sf_louder_n,
+        "spoken_vs_fresh_lead_size_quieter": sf_quieter_n,
+        "spoken_vs_fresh_lean": sf_lean_bit,
+        "spoken_vs_fresh_lean_warn": sf_lean_warn,
+        "spoken_vs_fresh_delta_pp": sf_delta_pp,
+        "spoken_vs_fresh_delta_severity": sf_delta_sev,
+        "spoken_vs_fresh_lean_vs_delta": sf_lean_vs_delta,
+        "spoken_vs_fresh_lean_vs_delta_warn": sf_lean_vs_delta_warn,
+        "spoken_vs_fresh_delta_lead": sf_delta_lead,
+        "spoken_vs_fresh_delta_lead_size": sf_d_size,
+        "spoken_vs_fresh_delta_lead_size_louder": sf_d_louder,
+        "spoken_vs_fresh_delta_lead_size_quieter": sf_d_quieter,
+        "aging_stale_lead": lead_bit,
+        "aging_stale_lead_name": lead_name,
+        "aging_stale_lead_share_pct": lead_share,
+        "aging_stale_sample_gap": sample_gap,
+        "aging_stale_lead_size": size,
+        "aging_stale_lead_size_louder": louder_n,
+        "aging_stale_lead_size_quieter": quieter_n,
+        "aging_share_pct": aging_share_pct,
+        "aging_share_severity": aging_share_sev,
+        "stale_share_pct": stale_share_pct,
+        "stale_share_severity": stale_share_sev,
+        "aging_stale_lean": as_lean_bit,
+        "aging_stale_lean_warn": as_lean_warn,
+        "aging_stale_delta_pp": as_delta_pp,
+        "aging_stale_delta_severity": as_delta_sev,
+        "aging_stale_lean_vs_delta": as_lean_vs_delta,
+        "aging_stale_lean_vs_delta_warn": as_lean_vs_delta_warn,
+        "aging_stale_delta_lead": as_delta_lead,
+        "aging_stale_delta_lead_size": as_d_size,
+        "aging_stale_delta_lead_size_louder": as_d_louder,
+        "aging_stale_delta_lead_size_quieter": as_d_quieter,
+        "delta_lead_size_moods": size_moods,
+        "delta_lead_size_moods_warn": size_moods_warn,
+    }
+
+
+def fetch_price_history(
+    symbol: str,
+    data_dir: Path,
+    *,
+    days: object = 90,
+    live: bool = True,
+    interval: str = "1d",
+) -> list[dict[str, Any]]:
+    """OHLC closes for symbol; cached under data/chart_bars/ (per interval)."""
+    path = _cache_path(data_dir, symbol, interval=interval)
+    if path is None:
+        # Unsafe token — do not touch disk outside chart_bars (xang1234 #498).
+        return []
+    days_n = _coerce_chart_days(days, default=90)
+    cached = _load_json(path, {})
+    # Intraday moves faster — shorter cache TTL.
+    max_age = 45 * 60 if interval != "1d" else 6 * 3600
+    cleaned = _parse_chart_points(cached.get("points"))
+    fetched_at = _coerce_chart_fetched_at(cached.get("fetched_at"))
+
+    if (
+        cached.get("symbol") == symbol
+        and cached.get("interval", "1d") == interval
+        and cleaned
+        and fetched_at is not None
+        and (time.time() - fetched_at) < max_age
+    ):
+        return cleaned
+
+    if not live:
+        return cleaned
+
+    try:
+        import yfinance as yf
+
+        period = _yf_period_for(days_n, interval)
+        hist = yf.Ticker(symbol).history(period=period, interval=interval)
+        points: list[dict[str, Any]] = []
+        if hist is not None and not hist.empty:
+            for idx, row in hist.iterrows():
+                try:
+                    ts = idx.to_pydatetime().astimezone(timezone.utc)
+                except Exception:
+                    ts = datetime.now(timezone.utc)
+                close = _finite(row.get("Close"), default=float("nan"))
+                if not math.isfinite(close):
+                    continue
+                points.append(
+                    {
+                        "t": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "close": round(close, 6),
+                    }
+                )
+        if points:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(
+                    {
+                        "symbol": symbol,
+                        "interval": interval,
+                        "fetched_at": time.time(),
+                        "points": points,
+                    }
+                )
+                + "\n"
+            )
+        return points
+    except Exception:
+        return cleaned
+
+
+def build_price_panels(
+    data_dir: Path,
+    *,
+    days: object = 90,
+    live: Optional[bool] = None,
+    breakouts_n: object = None,
+    symbols_n: object = None,
+) -> list[dict[str, Any]]:
+    if live is None:
+        live = os.getenv("DESK_CHART_LIVE", "1").strip() not in {
+            "0",
+            "false",
+            "False",
+            "no",
+        }
+    days_n = _coerce_chart_days(days, default=90)
+    # True→1 must not invent a one-panel strip via breakouts[:True] / symbols[:True]
+    # (listed-fund / short-refuse name-cap peers — Charts was bare [:4] / [:8]).
+    brk_cap = _coerce_chart_symbol_cap(
+        PRICE_PANEL_BREAKOUT_CAP if breakouts_n is None else breakouts_n,
+        PRICE_PANEL_BREAKOUT_CAP,
+    )
+    sym_cap = _coerce_chart_symbol_cap(
+        PRICE_PANEL_SYMBOLS_CAP if symbols_n is None else symbols_n,
+        PRICE_PANEL_SYMBOLS_CAP,
+    )
+    portfolio = _load_json(data_dir / "portfolio.json", {})
+    holds_raw = portfolio.get("holdings")
+    holdings = list(holds_raw.keys()) if isinstance(holds_raw, dict) else []
+    # Also include top scan breakouts for color
+    opp, _pin = _load_opportunities(data_dir)
+    breakouts = opp.get("stock_breakouts")
+    extras: list[str] = []
+    if isinstance(breakouts, list):
+        for r in breakouts[:brk_cap]:
+            if isinstance(r, dict) and r.get("symbol"):
+                extras.append(str(r["symbol"]))
+    symbols: list[str] = []
+    for s in holdings + extras:
+        if s and s not in symbols:
+            symbols.append(str(s))
+    symbols = symbols[:sym_cap]
+    names = resolve_symbol_names(symbols, data_dir, live=False)
+    panels = []
+    for sym in symbols:
+        pts = fetch_price_history(
+            sym, data_dir, days=days_n, live=live, interval="1d"
+        )
+        if len(pts) < 2:
+            continue
+        base = _finite(pts[0]["close"])
+        if base <= 0:
+            continue
+        indexed = []
+        for p in pts:
+            close = _finite(p["close"], default=float("nan"))
+            if not math.isfinite(close):
+                continue
+            indexed.append(
+                {
+                    "t": p["t"],
+                    "close": close,
+                    "rebased": round(close / base * 100, 4),
+                }
+            )
+        if len(indexed) < 2:
+            continue
+        last = indexed[-1]
+        bar_meta = chart_last_bar_meta(indexed)
+        panels.append(
+            {
+                "symbol": sym,
+                "name": display_name(sym, names) or sym,
+                "points": indexed,
+                "last": last["close"],
+                "change_pct": round(last["rebased"] - 100, 2),
+                **bar_meta,
+            }
+        )
+    return panels
+
+
+def build_from_buy_panels(
+    data_dir: Path,
+    *,
+    days: object = 180,
+    live: Optional[bool] = None,
+    symbols_n: object = None,
+) -> list[dict[str, Any]]:
+    """Open lots rebased to avg buy (=100). Honest path since entry — no forecast."""
+    if live is None:
+        live = os.getenv("DESK_CHART_LIVE", "1").strip() not in {
+            "0",
+            "false",
+            "False",
+            "no",
+        }
+    days_n = _coerce_chart_days(days, default=180)
+    # True→1 must not invent a one-panel strip via holdings[:True]
+    # (price-panel / listed-fund name-cap peers — from-buy was bare [:10]).
+    sym_cap = _coerce_chart_symbol_cap(
+        FROM_BUY_PANEL_SYMBOLS_CAP if symbols_n is None else symbols_n,
+        FROM_BUY_PANEL_SYMBOLS_CAP,
+    )
+    portfolio = _load_json(data_dir / "portfolio.json", {})
+    holdings = portfolio.get("holdings") or {}
+    avg = portfolio.get("avg_buy_price") or {}
+    entry_times = _load_json(data_dir / "entry_times.json", {})
+    opportunities, _pin = _load_opportunities(data_dir)
+    from openbb_backend.desk import _coerce_entry_ts, _prices_from_scan
+
+    marks = _prices_from_scan(opportunities)
+    symbols = [str(s) for s in holdings.keys() if s][:sym_cap]
+    names = resolve_symbol_names(symbols, data_dir, live=False)
+    panels: list[dict[str, Any]] = []
+
+    for sym in symbols:
+        buy_price = _finite(avg.get(sym))
+        qty = _finite(holdings.get(sym))
+        if buy_price <= 0 or qty <= 0:
+            continue
+        entry_ts = _coerce_entry_ts(entry_times.get(sym)) or 0.0
+        buy_dt: Optional[datetime] = None
+        if entry_ts > 0:
+            buy_dt = datetime.fromtimestamp(entry_ts, tz=timezone.utc)
+
+        now = datetime.now(timezone.utc)
+        span_hours_est = (
+            max(0.0, (now - buy_dt).total_seconds() / 3600.0)
+            if buy_dt
+            else float(days_n * 24)
+        )
+        is_crypto = "-USD" in sym.upper() or sym.upper().endswith("USDT")
+        interval = hold_chart_interval(span_hours_est, is_crypto=is_crypto)
+        hist_days = max(2, min(days_n, int(span_hours_est / 24) + 2))
+        if interval != "1d":
+            hist_days = min(hist_days, 7 if interval == "15m" else 30)
+
+        hist = fetch_price_history(
+            sym, data_dir, days=hist_days, live=live, interval=interval
+        )
+        # Fall back to daily if intraday empty (offline / provider gap).
+        if len(hist) < 2 and interval != "1d":
+            hist = fetch_price_history(
+                sym, data_dir, days=days_n, live=live, interval="1d"
+            )
+            interval = "1d"
+
+        pts: list[dict[str, Any]] = []
+        for p in hist:
+            ts = _parse_trade_ts(str(p.get("t") or ""))
+            if ts is None:
+                continue
+            if buy_dt and ts < buy_dt:
+                continue
+            close = _finite(p.get("close"), default=float("nan"))
+            if not math.isfinite(close) or close <= 0:
+                continue
+            pts.append({"t": ts.strftime("%Y-%m-%dT%H:%M:%SZ"), "close": close})
+
+        # Always anchor at the fill so short holds still chart.
+        buy_iso = (
+            buy_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if buy_dt
+            else (pts[0]["t"] if pts else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        )
+        if not pts or pts[0]["t"] > buy_iso:
+            pts = [{"t": buy_iso, "close": buy_price}] + pts
+        elif abs(pts[0]["close"] - buy_price) / buy_price > 0.02:
+            # Prefer cost basis as the day-0 mark when history starts mid-hold.
+            pts = [{"t": buy_iso, "close": buy_price}] + [
+                p for p in pts if p["t"] > buy_iso
+            ]
+
+        # Prefer current scan mark as the right edge so short holds aren't a
+        # flat cost→cost stub when the book already shows a different last.
+        mark = _finite(marks.get(sym))
+        now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if mark > 0:
+            pts = [p for p in pts if p["t"] < now_iso]
+            pts.append({"t": now_iso, "close": mark})
+        elif len(pts) < 2:
+            last_close = pts[0]["close"] if pts else buy_price
+            if not pts:
+                pts = [{"t": buy_iso, "close": buy_price}]
+            if pts[-1]["t"] != now_iso:
+                pts.append({"t": now_iso, "close": last_close})
+
+        indexed = []
+        for p in pts:
+            close = _finite(p["close"])
+            indexed.append(
+                {
+                    "t": p["t"],
+                    "close": close,
+                    "rebased": round(close / buy_price * 100, 4),
+                }
+            )
+        last = indexed[-1]
+        first_t = indexed[0]["t"]
+        last_t = last["t"]
+        span_hours = 0.0
+        try:
+            t0 = datetime.fromisoformat(first_t.replace("Z", "+00:00"))
+            t1 = datetime.fromisoformat(last_t.replace("Z", "+00:00"))
+            span_hours = max(0.0, (t1 - t0).total_seconds() / 3600.0)
+        except ValueError:
+            span_hours = 0.0
+        panels.append(
+            {
+                "symbol": sym,
+                "name": display_name(sym, names) or sym,
+                "buy_price": round(buy_price, 6),
+                "bought_at": buy_iso,
+                "quantity": qty,
+                "points": indexed,
+                "interval": interval,
+                "last": last["close"],
+                "first_t": first_t,
+                "last_t": last_t,
+                "span_hours": round(span_hours, 2),
+                "change_pct": round(last["rebased"] - 100, 2),
+                "note": "Rebased to your avg buy (100). No forecast.",
+            }
+        )
+    panels.sort(key=lambda p: abs(p["change_pct"]), reverse=True)
+    return panels
+
+
+def _apply_fill_to_lots(
+    lots: dict[str, dict[str, float]], trade: dict[str, Any]
+) -> None:
+    side = str(trade.get("type") or "").upper()
+    sym = str(trade.get("symbol") or "")
+    if not sym:
+        return
+    qty = _finite(trade.get("quantity"))
+    price = _finite(trade.get("price"))
+    if qty <= 0 or price < 0:
+        return
+    if side == "BUY":
+        lot = lots.setdefault(sym, {"qty": 0.0, "cost": 0.0})
+        lot["qty"] += qty
+        lot["cost"] += qty * price
+    elif side == "SELL":
+        lot = lots.setdefault(sym, {"qty": 0.0, "cost": 0.0})
+        avg = (lot["cost"] / lot["qty"]) if lot["qty"] else price
+        lot["qty"] = max(0.0, lot["qty"] - qty)
+        lot["cost"] = max(0.0, lot["qty"] * avg)
+        if lot["qty"] <= 1e-12:
+            lots.pop(sym, None)
+
+
+def _lots_asof(
+    timeline: list[tuple[datetime, dict[str, dict[str, float]]]], when: datetime
+) -> dict[str, dict[str, float]]:
+    state: dict[str, dict[str, float]] = {}
+    for ts, snap in timeline:
+        if ts <= when:
+            state = snap
+        else:
+            break
+    return {s: dict(v) for s, v in state.items()}
+
+
+def _close_on_or_before(
+    series: list[tuple[datetime, float]], when: datetime
+) -> Optional[float]:
+    px: Optional[float] = None
+    for ts, close in series:
+        if ts.date() <= when.date():
+            px = close
+        else:
+            break
+    return px
+
+
+def build_unrealized_curve(
+    data_dir: Path, *, days: object = 180, live: Optional[bool] = None
+) -> list[dict[str, Any]]:
+    """Open-book unrealized € / % vs cost (matches Overview). No forecast."""
+    if live is None:
+        live = os.getenv("DESK_CHART_LIVE", "1").strip() not in {
+            "0",
+            "false",
+            "False",
+            "no",
+        }
+    days_n = _coerce_chart_days(days, default=180)
+    from openbb_backend.desk import _coerce_entry_ts
+
+    portfolio = _load_json(data_dir / "portfolio.json", {})
+    holdings = portfolio.get("holdings") or {}
+    avg = portfolio.get("avg_buy_price") or {}
+    entry_times = _load_json(data_dir / "entry_times.json", {})
+    lots: dict[str, dict[str, float]] = {}
+    start_ts: Optional[datetime] = None
+    for sym, qty in holdings.items():
+        q = _finite(qty)
+        buy = _finite(avg.get(sym))
+        if q <= 0 or buy <= 0:
+            continue
+        lots[str(sym)] = {"qty": q, "cost": q * buy}
+        entry_ts = _coerce_entry_ts(entry_times.get(sym)) or 0.0
+        if entry_ts > 0:
+            dt = datetime.fromtimestamp(entry_ts, tz=timezone.utc)
+            if start_ts is None or dt < start_ts:
+                start_ts = dt
+
+    # Fall back to trade replay when entry_times are missing.
+    if not lots:
+        trades = _load_jsonl(data_dir / "trades.jsonl")
+        replay: dict[str, dict[str, float]] = {}
+        for trade in trades:
+            ts = _parse_trade_ts(str(trade.get("timestamp") or ""))
+            if ts is None:
+                continue
+            _apply_fill_to_lots(replay, trade)
+            if start_ts is None or ts < start_ts:
+                start_ts = ts
+        lots = replay
+
+    if not lots:
+        return []
+    if start_ts is None:
+        start_ts = datetime.now(timezone.utc)
+
+    price_by_sym: dict[str, list[tuple[datetime, float]]] = {}
+    day_set: set = set()
+    for sym in lots:
+        hist = fetch_price_history(
+            sym, data_dir, days=max(days_n, 120), live=live
+        )
+        series: list[tuple[datetime, float]] = []
+        for p in hist:
+            ts = _parse_trade_ts(str(p.get("t") or ""))
+            close = _finite(p.get("close"), default=float("nan"))
+            if ts is None or not math.isfinite(close) or close <= 0:
+                continue
+            series.append((ts, close))
+            day_set.add(ts.date())
+        series.sort(key=lambda x: x[0])
+        price_by_sym[sym] = series
+
+    start_day = start_ts.date()
+    days_sorted = sorted(d for d in day_set if d >= start_day)
+    # Anchor at buy day even if bars start later.
+    if start_day not in days_sorted:
+        days_sorted = [start_day] + days_sorted
+
+    points: list[dict[str, Any]] = []
+    for day in days_sorted:
+        when = datetime(day.year, day.month, day.day, 23, 59, 59, tzinfo=timezone.utc)
+        cost = 0.0
+        market_value = 0.0
+        active = 0
+        for sym, v in lots.items():
+            entry_ts = _coerce_entry_ts(entry_times.get(sym)) or 0.0
+            if entry_ts > 0:
+                bought = datetime.fromtimestamp(entry_ts, tz=timezone.utc).date()
+                if day < bought:
+                    continue
+            active += 1
+            cost += v["cost"]
+            px = _close_on_or_before(price_by_sym.get(sym) or [], when)
+            if px is None:
+                px = (v["cost"] / v["qty"]) if v["qty"] else 0.0
+            market_value += v["qty"] * px
+        if active == 0 or cost <= 0:
+            continue
+        unreal = market_value - cost
+        points.append(
+            {
+                "t": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "unrealized": round(unreal, 2),
+                "unrealized_pct": round((unreal / cost) * 100, 4),
+                "cost": round(cost, 2),
+                "market_value": round(market_value, 2),
+            }
+        )
+
+    by_day: dict[str, dict[str, Any]] = {}
+    for p in points:
+        by_day[p["t"][:10]] = p
+    return [by_day[k] for k in sorted(by_day)]
+
+
+def _latest_scan_breadth_pulse(data_dir: Path) -> dict[str, Any] | None:
+    """Latest UTC-day scan-list pulse from Breadth history (display only)."""
+    rows = _scan_breadth_history_rows(data_dir)
+    if not rows:
+        return None
+    last = rows[-1]
+    return last if isinstance(last, dict) else None
+
+
+def _scan_breadth_history_rows(data_dir: Path) -> list[dict[str, Any]]:
+    """Chronological scan-list daily pulse rows (display only)."""
+    rows = _load_json(data_dir / "scan_breadth_daily.json", [])
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+def _book_risk_glance_from_portfolio(data_dir: Path, portfolio: dict[str, Any]) -> dict[str, Any]:
+    """Slots/posture glance from cost marks (display only; Book has full strip)."""
+    from openbb_backend.desk import build_book_risk_glance
+
+    return build_book_risk_glance(_book_risk_report_from_portfolio(data_dir, portfolio))
+
+
+def _mark_coverage_from_data(
+    data_dir: Path, portfolio: dict[str, Any]
+) -> dict[str, Any]:
+    """Scan-price coverage (display only). Charts skip live quotes."""
+    from openbb_backend.desk import _prices_from_scan, build_mark_coverage
+
+    holdings_raw = portfolio.get("holdings") or {}
+    opp, _pin = _load_opportunities(data_dir)
+    prices = _prices_from_scan(opp)
+    rows: list[dict[str, Any]] = []
+    if isinstance(holdings_raw, dict):
+        for sym, qty in holdings_raw.items():
+            if _finite(qty) <= 0:
+                continue
+            px = prices.get(str(sym))
+            rows.append({"marked": px is not None and px > 0})
+    return build_mark_coverage(rows)
+
+
+def _ledger_health_from_data(data_dir: Path) -> dict[str, Any]:
+    from openbb_backend.desk import build_ledger_health
+
+    return build_ledger_health(data_dir)
+
+
+def _concentration_glance_from_portfolio(
+    data_dir: Path, portfolio: dict[str, Any]
+) -> dict[str, Any]:
+    """Largest-name vs 30% entry cap from cost marks (display only)."""
+    from openbb_backend.desk import build_concentration_glance
+
+    return build_concentration_glance(
+        _book_risk_report_from_portfolio(data_dir, portfolio)
+    )
+
+
+def _listed_fund_overlap_glance_from_portfolio(
+    portfolio: dict[str, Any],
+    *,
+    concentration_glance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Same-theme ETF/ETC doubles from open holdings (display only)."""
+    from openbb_backend.desk import build_listed_fund_overlap_glance
+
+    holdings_raw = portfolio.get("holdings") or {}
+    symbols: list[str] = []
+    if isinstance(holdings_raw, dict):
+        symbols = [str(s) for s in holdings_raw.keys() if str(s).strip()]
+    elif isinstance(holdings_raw, list):
+        for row in holdings_raw:
+            if isinstance(row, dict):
+                sym = str(row.get("symbol") or "").strip()
+            else:
+                sym = str(row or "").strip()
+            if sym:
+                symbols.append(sym)
+    conc = concentration_glance if isinstance(concentration_glance, dict) else {}
+    conc_tone = str(conc.get("tone") or "")
+    conc_warn: bool | None = (
+        bool(conc.get("warn"))
+        if conc.get("ready") and conc_tone in {"clear", "warn"}
+        else None
+    )
+    return build_listed_fund_overlap_glance(
+        symbols, concentration_warn=conc_warn
+    )
+
+
+def _book_risk_report_from_portfolio(
+    data_dir: Path, portfolio: dict[str, Any]
+) -> dict[str, Any]:
+    """Shared book_risk_report from cost marks (display only)."""
+    from stock_checker.risk_halts import book_risk_report
+    from stock_checker.trader_config import load_trader_config
+
+    cash = _finite(portfolio.get("cash"))
+    holdings_raw = portfolio.get("holdings") or {}
+    avg = portfolio.get("avg_buy_price") or {}
+    rows: list[dict[str, Any]] = []
+    cost = 0.0
+    if isinstance(holdings_raw, dict):
+        for sym, qty in holdings_raw.items():
+            q = _finite(qty)
+            px = _finite(avg.get(sym) if isinstance(avg, dict) else 0)
+            mv = q * px
+            cost += mv
+            rows.append({"symbol": str(sym), "market_value": mv})
+    equity = cash + cost
+    cfg = load_trader_config(data_dir)
+    # Pass slots via refuse helper — int(True)→1 must not invent a 1-slot book.
+    return book_risk_report(
+        cash=cash,
+        equity=equity,
+        holdings=rows,
+        max_positions=_chart_slots(cfg.get("max_positions")),
+    )
+
+
+
+def _next_buy_glance_from_portfolio(data_dir: Path, portfolio: dict[str, Any]) -> dict[str, Any]:
+    """Suggested next-buy € from cost marks (display only; Overview has full block)."""
+    from openbb_backend.desk import build_next_buy_glance
+    from stock_checker.risk_halts import suggest_entry_notional
+    from stock_checker.trader_config import load_trader_config
+
+    cash = _finite(portfolio.get("cash"))
+    holdings_raw = portfolio.get("holdings") or {}
+    avg = portfolio.get("avg_buy_price") or {}
+    cost = 0.0
+    open_n = 0
+    if isinstance(holdings_raw, dict):
+        for sym, qty in holdings_raw.items():
+            q = _finite(qty)
+            if q <= 0:
+                continue
+            open_n += 1
+            px = _finite(avg.get(sym) if isinstance(avg, dict) else 0)
+            cost += q * px
+    equity = cash + cost
+    cfg = load_trader_config(data_dir)
+    return build_next_buy_glance(
+        suggest_entry_notional(
+            cash=cash,
+            equity=equity,
+            open_positions=open_n,
+            max_positions=_chart_slots(cfg.get("max_positions")),
+            position_size=0.10,
+        )
+    )
+
+
+def _soft_gate_runtime_from_config(data_dir: Path) -> dict[str, Any]:
+    """Ops soft-gate toggles for soft-allow lead↔config provenance."""
+    from stock_checker.trader_config import load_trader_config
+
+    cfg = load_trader_config(data_dir)
+    return {
+        "regime_gate": bool(cfg.get("regime_gate", True)),
+        "rs_gate": bool(cfg.get("rs_gate", True)),
+        "breadth_gate": bool(cfg.get("breadth_gate", True)),
+        "promote_experiment_strategy": bool(
+            cfg.get("promote_experiment_strategy", False)
+        ),
+    }
+
+
+def _entry_gates_glance_from_config(data_dir: Path) -> dict[str, Any]:
+    """Regime/RS/breadth/promote on/off from Ops file (display only)."""
+    from openbb_backend.desk import build_entry_gates_glance
+
+    return build_entry_gates_glance(_soft_gate_runtime_from_config(data_dir))
+
+
+def _soft_allow_glance_from_data(
+    data_dir: Path,
+    *,
+    scan_time: str = "",
+    laya_freshness: str = "",
+    debate_freshness: str = "",
+) -> dict[str, Any]:
+    """Soft-allow glance with Ops toggles for lead↔config clash."""
+    from openbb_backend.desk import build_soft_allow_glance
+    from stock_checker.gate_audit import enrich_soft_allows, recent_soft_allows
+
+    return build_soft_allow_glance(
+        enrich_soft_allows(recent_soft_allows(data_dir, limit=12)),
+        scan_time=scan_time,
+        laya_freshness=laya_freshness,
+        debate_freshness=debate_freshness,
+        runtime=_soft_gate_runtime_from_config(data_dir),
+    )
+
+
+def _calm_streak_glance_from_data(data_dir: Path) -> dict[str, Any]:
+    """Paper-calm promote-unlock line from paper_calm.json (display only)."""
+    from openbb_backend.desk import build_calm_streak_glance
+
+    calm = _load_json(data_dir / "paper_calm.json", {})
+    if not isinstance(calm, dict):
+        calm = {}
+    # Pass raw streak/required — pre-int(True) bypassed desk bool refuse.
+    return build_calm_streak_glance(
+        {
+            "calm_streak_days": calm.get("streak_days"),
+            "calm_required_days": calm.get("required_days"),
+            "calm_ready": bool(calm.get("ready_for_compose_default")),
+            "calm_detail": str(calm.get("detail") or ""),
+        },
+        data_dir=data_dir,
+    )
+
+
+def _promote_ab_glance_from_data(data_dir: Path) -> dict[str, Any]:
+    """Promote A/B window line from trader_config + trades (display only)."""
+    from openbb_backend.desk import build_promote_ab_glance
+    from stock_checker.trader_config import load_trader_config
+
+    cfg = load_trader_config(data_dir)
+    portfolio = _load_json(data_dir / "portfolio.json", {})
+    holds = portfolio.get("holdings") if isinstance(portfolio, dict) else None
+    open_n: int | None = None
+    if isinstance(holds, dict):
+        open_n = len(holds)
+    elif isinstance(holds, list):
+        open_n = len(holds)
+    # Raw knobs — desk/window_b already refuse bool (True→1 slot / 1h hold).
+    return build_promote_ab_glance(
+        {
+            "promote_experiment_strategy": bool(
+                cfg.get("promote_experiment_strategy", False)
+            ),
+            "max_positions": cfg.get("max_positions"),
+            "min_hold_hours": cfg.get("min_hold_hours"),
+            "fee_preset": str(cfg.get("fee_preset") or "revolut_standard"),
+            "regime_gate": bool(cfg.get("regime_gate", True)),
+            "rs_gate": bool(cfg.get("rs_gate", True)),
+            "breadth_gate": bool(cfg.get("breadth_gate", True)),
+            "ai_mode": str(cfg.get("ai_mode") or "off"),
+            "ai_multi_role": bool(cfg.get("ai_multi_role", True)),
+            "open_positions": open_n,
+        },
+        data_dir=data_dir,
+        open_positions=open_n,
+    )
+
+
+def _promote_contract_glance_from_config(data_dir: Path) -> dict[str, Any]:
+    """Promote entry-veto contract from Ops file (display only)."""
+    from openbb_backend.desk import build_promote_contract_glance
+    from stock_checker.trader_config import load_trader_config
+
+    cfg = load_trader_config(data_dir)
+    return build_promote_contract_glance(
+        {
+            "promote_experiment_strategy": bool(
+                cfg.get("promote_experiment_strategy", False)
+            ),
+        }
+    )
+
+
+def _gate_roles_glance_from_config(data_dir: Path) -> dict[str, Any]:
+    """Regime vs RS vs breadth role map from Ops file (A14; display only)."""
+    from openbb_backend.desk import build_gate_roles_glance
+    from stock_checker.trader_config import load_trader_config
+
+    cfg = load_trader_config(data_dir)
+    return build_gate_roles_glance(
+        {
+            "regime_gate": bool(cfg.get("regime_gate", True)),
+            "rs_gate": bool(cfg.get("rs_gate", True)),
+            "breadth_gate": bool(cfg.get("breadth_gate", True)),
+        }
+    )
+
+
+def _crypto_policy_glance_from_portfolio(portfolio: dict[str, Any]) -> dict[str, Any]:
+    """Live crypto slot line from portfolio holdings (display only)."""
+    from openbb_backend.desk import build_crypto_policy_glance
+
+    holdings_raw = portfolio.get("holdings") or {}
+    rows: list[dict[str, Any]] = []
+    if isinstance(holdings_raw, dict):
+        for sym in holdings_raw.keys():
+            s = str(sym or "").strip()
+            if s:
+                rows.append({"symbol": s})
+    elif isinstance(holdings_raw, list):
+        rows = [r for r in holdings_raw if isinstance(r, dict)]
+    return build_crypto_policy_glance(rows)
+
+
+def _book_limits_glance_from_config(data_dir: Path) -> dict[str, Any]:
+    """Slots · min hold · fee preset from Ops file (display only)."""
+    from openbb_backend.desk import build_book_limits_glance
+    from stock_checker.trader_config import load_trader_config
+
+    cfg = load_trader_config(data_dir)
+    return build_book_limits_glance(
+        {
+            "max_positions": cfg.get("max_positions"),
+            "min_hold_hours": cfg.get("min_hold_hours"),
+            "fee_preset": cfg.get("fee_preset"),
+        }
+    )
+
+
+def _loop_cadence_glance_from_config(_data_dir: Path) -> dict[str, Any]:
+    """Scan / trade loop floors — match desk compose display defaults."""
+    from openbb_backend.desk import build_loop_cadence_glance
+
+    return build_loop_cadence_glance(
+        {"scan_interval_min": 15, "trade_interval_min": 5}
+    )
+
+
+def _improve_tick_glance_from_data(
+    data_dir: Path, *, scan_time: str = ""
+) -> dict[str, Any]:
+    """Last Cursor improve tick age — match desk overnight honesty."""
+    from openbb_backend.desk import (
+        _coerce_scan_interval_min_to_sec,
+        build_improve_tick_glance,
+    )
+    from stock_checker.trader_config import load_trader_config
+
+    cfg = load_trader_config(data_dir)
+    # Refuse bool scan_interval_min — True→1m invents a fake improve/scan clash.
+    return build_improve_tick_glance(
+        data_dir,
+        scan_time=scan_time,
+        scan_interval_sec=_coerce_scan_interval_min_to_sec(
+            cfg.get("scan_interval_min")
+        ),
+    )
+
+
+def _ai_mode_glance_from_config(data_dir: Path) -> dict[str, Any]:
+    """AI mode · model · multi-role from Ops file (display only)."""
+    from openbb_backend.desk import build_ai_mode_glance
+    from stock_checker.trader_config import load_trader_config
+
+    cfg = load_trader_config(data_dir)
+    return build_ai_mode_glance(
+        {
+            "ai_mode": cfg.get("ai_mode"),
+            "ai_model": cfg.get("ai_model"),
+            "ai_multi_role": cfg.get("ai_multi_role", True),
+        }
+    )
+
+
+def _ai_validate_scope_glance_from_config(data_dir: Path) -> dict[str, Any]:
+    """AI top-N validate scope from Ops file (display only)."""
+    from openbb_backend.desk import build_ai_validate_scope_glance
+    from stock_checker.trader_config import load_trader_config
+
+    cfg = load_trader_config(data_dir)
+    return build_ai_validate_scope_glance({"ai_mode": cfg.get("ai_mode")})
+
+
+def _rebuy_cooldown_glance_from_data(data_dir: Path) -> dict[str, Any]:
+    """Anti flip-flop rebuy cooldown from exit_times.json (display only)."""
+    from openbb_backend.desk import build_rebuy_cooldown_glance
+    from stock_checker.trader_config import load_trader_config
+
+    cfg = load_trader_config(data_dir)
+    exit_times = _load_json(data_dir / "exit_times.json", {})
+    if not isinstance(exit_times, dict):
+        exit_times = {}
+    # Refuse bool min_hold — True→1h invents a 1h rebuy lock.
+    hold_h = _chart_hold_hours(cfg.get("min_hold_hours"))
+    return build_rebuy_cooldown_glance(
+        exit_times,
+        cooldown_seconds=max(0.0, hold_h) * 3600.0,
+    )
+
+
+def _daily_loss_glance_from_data(
+    data_dir: Path, portfolio: dict[str, Any]
+) -> dict[str, Any]:
+    """UTC-day realized vs −2% soft halt from trades.jsonl (display only)."""
+    from openbb_backend.desk import build_daily_loss_glance
+    from stock_checker.risk_halts import realized_pnl_for_utc_day
+
+    # tradermonty #700/#655: bool/gap start must not invent €1 capital.
+    initial = _curve_cash(portfolio.get("initial_cash"))
+    if initial is None:
+        initial = 0.0
+    return build_daily_loss_glance(realized_pnl_for_utc_day(data_dir), initial)
+
+
+def _post_sl_cooldown_glance_from_data(data_dir: Path) -> dict[str, Any]:
+    """Post-SL buy cooldown from last stop-loss sell (display only)."""
+    from openbb_backend.desk import build_post_sl_cooldown_glance
+    from stock_checker.risk_halts import latest_stop_loss_sell
+
+    hit = latest_stop_loss_sell(data_dir)
+    if hit is None:
+        return build_post_sl_cooldown_glance(None, None)
+    return build_post_sl_cooldown_glance(hit[0], hit[1])
+
+
+def _fee_burn_glance_from_portfolio(
+    data_dir: Path, portfolio: dict[str, Any]
+) -> dict[str, Any]:
+    """Fee-drag % of start + vs realized sell P&L (display only)."""
+    from openbb_backend.desk import build_fee_burn_glance
+
+    # tradermonty #700/#655: bool/gap fees·start / sell P&L must not invent €1.
+    fees = _curve_cash(portfolio.get("total_fees_paid"))
+    if fees is None:
+        fees = 0.0
+    initial = _curve_cash(portfolio.get("initial_cash"))
+    if initial is None:
+        initial = 0.0
+    trades = _load_jsonl(data_dir / "trades.jsonl")
+    sells = [
+        t
+        for t in trades
+        if isinstance(t, dict) and str(t.get("type") or "").upper() == "SELL"
+    ]
+    realized: float | None = None
+    if sells:
+        parts = [_curve_signed(t.get("profit_loss")) for t in sells]
+        readable = [p for p in parts if p is not None]
+        # All sells unreadable → None (do not invent flat €0 vs fees).
+        realized = sum(readable) if readable else None
+    return build_fee_burn_glance(fees, initial, realized_pnl=realized)
+
+
+def _fee_allowance_glance_from_data(data_dir: Path) -> dict[str, Any]:
+    """Free monthly legs left from portfolio + Ops fee preset (display only)."""
+    from openbb_backend.desk import build_fee_allowance_glance
+    from stock_checker.trader_config import load_trader_config
+
+    portfolio = _load_json(data_dir / "portfolio.json", {})
+    if not isinstance(portfolio, dict):
+        portfolio = {}
+    cfg = load_trader_config(data_dir)
+    allowance_month = str(portfolio.get("fee_allowance_month") or "")
+    current_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    used_raw = portfolio.get("fee_allowance_used")
+    if allowance_month != current_month:
+        used_raw = 0
+    # Raw free/used — desk _fee_allowance_int refuses bool (True→1 free leg).
+    free_raw = portfolio.get("free_legs_per_month")
+    if free_raw is None:
+        free_raw = cfg.get("free_legs_per_month")
+    return build_fee_allowance_glance(
+        {
+            "fee_preset": cfg.get("fee_preset") or "revolut_standard",
+            "free_legs_per_month": free_raw,
+            "fee_allowance_used": used_raw,
+            "fee_allowance_month": current_month,
+        }
+    )
+
+
+def _stuck_capital_glance_from_data(data_dir: Path) -> dict[str, Any]:
+    """A15 min-hold underwater glance from portfolio + scan marks (display only)."""
+    import time
+
+    from openbb_backend.desk import (
+        _coerce_entry_ts,
+        _coerce_desk_mark,
+        _fmt_hold,
+        _prices_from_scan,
+        build_stuck_capital_glance,
+    )
+    from stock_checker.trader_config import load_trader_config
+
+    portfolio = _load_json(data_dir / "portfolio.json", {})
+    if not isinstance(portfolio, dict):
+        portfolio = {}
+    entry_times = _load_json(data_dir / "entry_times.json", {})
+    if not isinstance(entry_times, dict):
+        entry_times = {}
+    opp, _pin = _load_opportunities(data_dir)
+    cfg = load_trader_config(data_dir)
+    # Refuse bool min_hold — True→1h invents early stuck unlock.
+    min_hold_s = max(4.0, _chart_hold_hours(cfg.get("min_hold_hours"))) * 3600.0
+    holdings = portfolio.get("holdings") or {}
+    avg = portfolio.get("avg_buy_price") or {}
+    if not isinstance(holdings, dict) or not isinstance(avg, dict):
+        return build_stuck_capital_glance([])
+    from stock_checker.portfolio import fill_price_ok, long_only_quantity_ok
+
+    marks = _prices_from_scan(opp)
+    now = time.time()
+    stuck: list[dict[str, Any]] = []
+    for sym, qty in holdings.items():
+        # Bool/0/gap qty·avg must not invent 1-share / €1 stuck rows.
+        if not long_only_quantity_ok(qty):
+            continue
+        buy_raw = avg.get(sym)
+        if not fill_price_ok(buy_raw):
+            continue
+        q = float(qty)
+        buy = float(buy_raw)
+        last = _coerce_desk_mark(marks.get(str(sym))) or buy
+        unreal_pct = ((last - buy) / buy) * 100.0
+        entry_ts = _coerce_entry_ts(entry_times.get(sym))
+        if not entry_ts:
+            continue
+        held_s = now - entry_ts
+        if held_s >= min_hold_s and unreal_pct < 0:
+            stuck.append(
+                {
+                    "symbol": str(sym),
+                    "unrealized_pct": unreal_pct,
+                    "held": _fmt_hold(held_s),
+                    "held_seconds": held_s,
+                }
+            )
+    return build_stuck_capital_glance(stuck)
+
+
+
+def _book_posture_glance_from_data(data_dir: Path) -> dict[str, Any]:
+    """Live posture slots from portfolio (no cost-flat trim guess; display only)."""
+    from openbb_backend.desk import build_book_posture_glance
+    from stock_checker.trader_config import load_trader_config
+
+    portfolio = _load_json(data_dir / "portfolio.json", {})
+    if not isinstance(portfolio, dict):
+        portfolio = {}
+    cfg = load_trader_config(data_dir)
+    from stock_checker.portfolio import long_only_quantity_ok
+
+    holdings = portfolio.get("holdings") or {}
+    rows: list[dict[str, Any]] = []
+    if isinstance(holdings, dict):
+        for sym, qty in holdings.items():
+            # Bool/0/gap qty must not invent a 1-share posture slot.
+            if not long_only_quantity_ok(qty):
+                continue
+            rows.append({"symbol": str(sym), "held_seconds": 0.0})
+    # Raw/slots helpers — desk posture refuse bool True→1 slot / 1h hold.
+    return build_book_posture_glance(
+        rows,
+        max_positions=_chart_slots(cfg.get("max_positions")),
+        min_hold_hours=_chart_hold_hours(cfg.get("min_hold_hours")),
+        suggest_trim=False,
+    )
+
+
+def _min_hold_lock_glance_from_data(data_dir: Path) -> dict[str, Any]:
+    """Open lots still inside min-hold (display only; pairs with stuck-capital)."""
+    import time
+
+    from openbb_backend.desk import _coerce_entry_ts, build_min_hold_lock_glance
+    from stock_checker.trader_config import load_trader_config
+
+    portfolio = _load_json(data_dir / "portfolio.json", {})
+    if not isinstance(portfolio, dict):
+        portfolio = {}
+    entry_times = _load_json(data_dir / "entry_times.json", {})
+    if not isinstance(entry_times, dict):
+        entry_times = {}
+    cfg = load_trader_config(data_dir)
+    min_hold_h = _chart_hold_hours(cfg.get("min_hold_hours"))
+    from stock_checker.portfolio import long_only_quantity_ok
+
+    holdings = portfolio.get("holdings") or {}
+    if not isinstance(holdings, dict):
+        return build_min_hold_lock_glance([], min_hold_hours=min_hold_h)
+    now = time.time()
+    rows: list[dict[str, Any]] = []
+    for sym, qty in holdings.items():
+        # Bool/0/gap qty must not invent a 1-share min-hold lock row.
+        if not long_only_quantity_ok(qty):
+            continue
+        entry_ts = _coerce_entry_ts(entry_times.get(sym))
+        # Missing/invalid stamp → held_seconds None (ghost / UNKNOWN hold age);
+        # do not skip — bool True→1.0 must not invent ~1970 past-min-hold.
+        held_s = max(0.0, now - entry_ts) if entry_ts else None
+        rows.append(
+            {
+                "symbol": str(sym),
+                "held_seconds": held_s,
+            }
+        )
+    return build_min_hold_lock_glance(rows, min_hold_hours=min_hold_h)
+
+
+def _postmortem_glance_from_data(data_dir: Path) -> dict[str, Any]:
+    """Newest closed-round glance from trades.jsonl (display only)."""
+    from openbb_backend.desk import build_postmortem_glance
+    from stock_checker.trade_postmortem import DEFAULT_LIMIT as POSTMORTEM_LIMIT
+    from stock_checker.trade_postmortem import closed_rounds
+
+    trades = _load_jsonl(data_dir / "trades.jsonl")
+    return build_postmortem_glance(closed_rounds(trades, limit=POSTMORTEM_LIMIT))
+
+
+def load_chart_payload(data_dir: Path) -> dict[str, Any]:
+    # Local import keeps charts free of desk module load at import time.
+    from openbb_backend.desk import (
+        build_breadth_glance,
+        build_breakout_guard_glance,
+        build_earnings_blackout_glance,
+        build_equity_hours_glance,
+        build_exit_policy_glance,
+        build_junk_filter_glance,
+        build_loss_rotation_glance,
+        build_stale_rotation_glance,
+        build_ai_roles_glance,
+        build_laya_glance,
+        build_ai_debate_glance,
+        build_gate_params_glance,
+        build_universe_discovery_glance,
+        build_atr_display_glance,
+        build_entry_slots_glance,
+        build_pretrade_glance,
+        build_scan_freshness,
+        build_session_glance,
+        policy_honesty_fold_meta,
+        memory_advisory_clock_tones,
+        scan_list_rows,
+    )
+    from stock_checker.risk_halts import pretrade_status
+
+    opp, archive_res = _load_opportunities(data_dir)
+    scan_time = str(opp.get("scan_time") or "")
+    portfolio = _load_json(data_dir / "portfolio.json", {})
+    if not isinstance(portfolio, dict):
+        portfolio = {}
+    # tradermonty #700/#655: bool/gap start must not invent €1 pretrade capital.
+    initial = _curve_cash(portfolio.get("initial_cash"))
+    if initial is None:
+        initial = 0.0
+    pretrade_level, pretrade_notes = pretrade_status(data_dir, initial_cash=initial)
+    laya_tone, debate_tone = memory_advisory_clock_tones(data_dir)
+    price_panels = build_price_panels(data_dir)
+    concentration_glance = _concentration_glance_from_portfolio(
+        data_dir, portfolio
+    )
+    listed_fund_overlap_glance = _listed_fund_overlap_glance_from_portfolio(
+        portfolio, concentration_glance=concentration_glance
+    )
+    from openbb_backend.desk import attach_concentration_funds_lean
+
+    concentration_glance = attach_concentration_funds_lean(
+        concentration_glance, listed_fund_overlap_glance
+    )
+
+    payload = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "equity": build_equity_curve(data_dir),
+        "unrealized": build_unrealized_curve(data_dir),
+        "allocation": build_allocation(data_dir),
+        "prices": price_panels,
+        "price_bars_glance": chart_price_bars_glance(price_panels),
+        "from_buy": build_from_buy_panels(data_dir),
+        "breadth_glance": build_breadth_glance(
+            _latest_scan_breadth_pulse(data_dir),
+            history=_scan_breadth_history_rows(data_dir),
+        ),
+        "scan_freshness": build_scan_freshness(
+            scan_time,
+            archive_pin=str(archive_res.get("pin") or ""),
+            archive_pin_bit=str(archive_res.get("bit") or ""),
+            archive_pin_bit_core=str(
+                archive_res.get("bit_core") or archive_res.get("bit") or ""
+            ),
+            archive_pin_lean=str(archive_res.get("pin_lean") or ""),
+            archive_pin_lean_warn=bool(archive_res.get("pin_lean_warn")),
+            archive_pin_warn=bool(archive_res.get("warn")),
+        ),
+        "pretrade_glance": build_pretrade_glance(pretrade_level, pretrade_notes),
+        "next_buy_glance": _next_buy_glance_from_portfolio(data_dir, portfolio),
+        "soft_allow_glance": _soft_allow_glance_from_data(
+            data_dir,
+            scan_time=scan_time,
+            laya_freshness=laya_tone,
+            debate_freshness=debate_tone,
+        ),
+        "entry_gates_glance": _entry_gates_glance_from_config(data_dir),
+        "calm_streak_glance": _calm_streak_glance_from_data(data_dir),
+        "promote_ab_glance": _promote_ab_glance_from_data(data_dir),
+        "crypto_policy_glance": _crypto_policy_glance_from_portfolio(portfolio),
+        "exit_policy_glance": build_exit_policy_glance(),
+        "earnings_blackout_glance": build_earnings_blackout_glance(),
+        "ai_mode_glance": _ai_mode_glance_from_config(data_dir),
+        "ai_roles_glance": build_ai_roles_glance(),
+        "laya_glance": build_laya_glance(data_dir, scan_time=scan_time),
+        "ai_debate_glance": build_ai_debate_glance(data_dir, scan_time=scan_time),
+        "ai_validate_scope_glance": _ai_validate_scope_glance_from_config(data_dir),
+        "session_glance": build_session_glance(),
+        "equity_hours_glance": build_equity_hours_glance(),
+        "breakout_guard_glance": build_breakout_guard_glance(),
+        "loss_rotation_glance": build_loss_rotation_glance(),
+        "stale_rotation_glance": build_stale_rotation_glance(),
+        "book_posture_glance": _book_posture_glance_from_data(data_dir),
+        "junk_filter_glance": build_junk_filter_glance(),
+        "universe_discovery_glance": build_universe_discovery_glance(data_dir),
+        "atr_display_glance": build_atr_display_glance(
+            scan_list_rows(opp.get("crypto_leaders"))
+            + scan_list_rows(opp.get("stock_breakouts"))
+            + scan_list_rows(opp.get("recommendations"))
+        ),
+        "entry_slots_glance": build_entry_slots_glance(),
+        "promote_contract_glance": _promote_contract_glance_from_config(data_dir),
+        "gate_roles_glance": _gate_roles_glance_from_config(data_dir),
+        "gate_params_glance": build_gate_params_glance(),
+        "book_limits_glance": _book_limits_glance_from_config(data_dir),
+        "rebuy_cooldown_glance": _rebuy_cooldown_glance_from_data(data_dir),
+        "daily_loss_glance": _daily_loss_glance_from_data(data_dir, portfolio),
+        "concentration_glance": concentration_glance,
+        "listed_fund_overlap_glance": listed_fund_overlap_glance,
+        "post_sl_cooldown_glance": _post_sl_cooldown_glance_from_data(data_dir),
+        "loop_cadence_glance": _loop_cadence_glance_from_config(data_dir),
+        "improve_tick_glance": _improve_tick_glance_from_data(
+            data_dir, scan_time=scan_time
+        ),
+        "fee_allowance_glance": _fee_allowance_glance_from_data(data_dir),
+        "fee_burn_glance": _fee_burn_glance_from_portfolio(data_dir, portfolio),
+        "stuck_capital_glance": _stuck_capital_glance_from_data(data_dir),
+        "min_hold_lock_glance": _min_hold_lock_glance_from_data(data_dir),
+        "postmortem_glance": _postmortem_glance_from_data(data_dir),
+        "book_risk_glance": _book_risk_glance_from_portfolio(data_dir, portfolio),
+        "mark_coverage": _mark_coverage_from_data(data_dir, portfolio),
+        "ledger_health": _ledger_health_from_data(data_dir),
+    }
+    # Charts JS reads these; a missing key fell back to the static category
+    # index and hid a hot fee / stale Yahoo glance inside the fold.
+    meta, warn = policy_honesty_fold_meta(payload)
+    payload["policy_honesty_meta"] = meta
+    payload["policy_honesty_warn"] = warn
+    return payload

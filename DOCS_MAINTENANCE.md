@@ -1,0 +1,26 @@
+# Documentation maintenance
+
+Keep docs honest for humans and agents. Prefer short truth over marketing.
+
+## Weekly checklist (agents)
+
+1. Diff code vs docs: compose services, CLI flags, AI defaults, ports.
+2. **Docs-gate:** every `scripts/…` path cited in active docs must exist, and every `--flag` after that path must be accepted by the script (or its `"$@"` Python target) — including flags on the next line after a fenced bash `\` continuation — `tests/test_docs_script_paths.py` + `./scripts/docs_weekly_check.sh` (tradermonty docs-gate paths + wrong-flag + shell-context).
+3. Update [README.md](README.md) and [FRIENDS.md](FRIENDS.md) if the happy path changed. Refresh `docs/screenshots/*.jpg` when the desk UI changed (`./scripts/capture_desk_screenshots.sh`).
+4. Consider a tagged release per [RELEASES.md](RELEASES.md) if enough user-visible work landed since the last tag.
+5. Sync [IMPROVEMENT.md](IMPROVEMENT.md) Done / Next from recent commits.
+6. Confirm [OPENBB.md](OPENBB.md), [GIT.md](GIT.md), [AGENTS.md](AGENTS.md) still match reality.
+7. Run offline tests: `docker run --rm ai-stock-checker pytest -q`
+8. Commit + push per [GIT.md](GIT.md) (never `.env`, never `data/`, never `results.tsv`).
+
+## Script
+
+```bash
+./scripts/docs_weekly_check.sh
+```
+
+Prints a status report; exit 0 when nothing obvious is stale, non-zero when review is needed.
+
+## Cadence
+
+Weekly agent loop: `AGENT_LOOP_TICK_docs` every 7 days (604800s).

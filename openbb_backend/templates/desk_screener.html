@@ -1,0 +1,467 @@
+{% extends "base.html" %}
+{% from "macros.html" import ticker, breadth_glance, scan_freshness, soft_allow_glance, pretrade_glance, next_buy_glance, book_risk_glance, mark_coverage_glance, ledger_health_glance, entry_gates_glance, calm_streak_glance, promote_ab_glance, crypto_policy_glance, exit_policy_glance, earnings_blackout_glance, ai_mode_glance, ai_roles_glance, laya_glance, ai_debate_glance, ai_validate_scope_glance, session_glance, equity_hours_glance, breakout_guard_glance, loss_rotation_glance, stale_rotation_glance, book_posture_glance, junk_filter_glance, universe_discovery_glance, atr_display_glance, entry_slots_glance, promote_contract_glance, gate_roles_glance, gate_params_glance, book_limits_glance, rebuy_cooldown_glance, daily_loss_glance, concentration_glance, listed_fund_overlap_glance, post_sl_cooldown_glance, loop_cadence_glance, improve_tick_glance, fee_allowance_glance, fee_burn_glance, stuck_capital_glance, min_hold_lock_glance, postmortem_glance %}
+{% block content %}
+{% set sc = snap.screener_counts|default({}) %}
+{% set n_rec = sc.n_rec|default(snap.recommendations|length) %}
+{% set n_crypto = sc.n_crypto|default(snap.crypto_leaders|length) %}
+{% set n_brk = sc.n_brk|default(snap.stock_breakouts|length) %}
+{% set n_total = sc.n_total|default(n_rec + n_crypto + n_brk) %}
+{% set lists_populated = sc.lists_populated|default((1 if n_rec else 0) + (1 if n_crypto else 0) + (1 if n_brk else 0)) %}
+<header class="page-head">
+  <p class="eyebrow">Screener</p>
+  <h1>Opportunities</h1>
+  <p class="lede">One scan, three lists — ranked ideas, crypto leaders, stock breakouts. Risk notes are display-only (day-range / vol proxy), not live stops.</p>
+  {{ scan_freshness(snap) }}
+  <p class="sub">{{ snap.scanned_symbols }} symbols tracked</p>
+  <p class="mode">{{ snap.weekend_hint }}</p>
+</header>
+
+<section class="strip" aria-label="Screener counts">
+  <div>
+    <span class="k">Recommendations</span>
+    <span class="v">{{ n_rec }}</span>
+  </div>
+  <div>
+    <span class="k">Crypto leaders</span>
+    <span class="v">{{ n_crypto }}</span>
+  </div>
+  <div>
+    <span class="k">Stock breakouts</span>
+    <span class="v">{{ n_brk }}</span>
+  </div>
+  <div>
+    <span class="k">Total</span>
+    <span class="v">{{ n_total }}</span>
+    <span class="weight{% if sc.tone|default('flat') == 'warn' %} warn{% endif %}">{{ sc.weight_core|default(sc.weight|default("row slots")) }}</span>
+    {% if sc.weight_lean %}
+    <details class="screener-weight-lean{% if sc.tone|default('flat') == 'warn' %} warn{% endif %}"{% if sc.tone|default('flat') == 'warn' %} open{% endif %}>
+      <summary>weight lean <span class="meta">{{ sc.weight_lean_meta|default('quiet') }}</span></summary>
+      <p class="weight{% if sc.tone|default('flat') == 'warn' %} warn{% endif %}">{{ sc.weight_lean }}</p>
+    </details>
+    {% endif %}
+  </div>
+  <div>
+    <span class="k">Lists</span>
+    <span class="v">{{ lists_populated }}/3</span>
+    <span class="weight">populated this scan</span>
+  </div>
+</section>
+
+{{ breadth_glance(
+  snap,
+  "screener-breadth-h",
+  "Scan breadth beside screener",
+  "Scan-list estimate (priced of N) + near-high / ±4% — context for lists below, not a gate."
+) }}
+
+{{ pretrade_glance(
+  snap,
+  "screener-pretrade-h",
+  "/desk",
+  "Overview →",
+  "Checklist before chasing scan names — FAIL blocks buys; WARN is fee burn / cooldown."
+) }}
+
+{{ next_buy_glance(
+  snap,
+  "screener-size-h",
+  "/desk",
+  "Overview size →",
+  "Suggested next-buy € before chasing scan names — Overview keeps the full size block."
+) }}
+
+{{ soft_allow_glance(snap) }}
+
+{{ entry_gates_glance(
+  snap,
+  "screener-gates-h",
+  "/desk/ops#cfg-h",
+  "Ops knobs →",
+  "Soft entry filters before chasing scan names — not a new gate; flip on Ops."
+) }}
+
+{{ calm_streak_glance(
+  snap,
+  "screener-calm-h",
+  "/desk/ops#calm-h",
+  "Ops calm →",
+  "Promote unlock streak before chasing scan names — calm ≠ edge."
+) }}
+
+{{ promote_ab_glance(
+  snap,
+  "screener-promote-ab-h",
+  "/desk/ops#ops-promote",
+  "Ops promote →",
+  "Fee-adjusted A/B window before chasing scan names — do not flip promote mid-window."
+) }}
+
+{{ book_posture_glance(
+  snap,
+  "screener-book-posture-h",
+  "/desk/book",
+  "Book →",
+  "Live open/at_cap/overweight vs max; overweight names next trim (winners first). Display only."
+) }}
+
+{{ book_risk_glance(
+  snap,
+  "screener-book-risk-h",
+  "/desk/book",
+  "Full book →",
+  "Slots and posture before chasing scan names — overweight means exits-only."
+) }}
+
+{{ mark_coverage_glance(
+  snap,
+  "screener-marks-h",
+  "/desk/book",
+  "Book marks →",
+  "Live mark vs cost fallback before chasing scan names. Incomplete coverage warns. Not a gate."
+) }}
+
+{{ ledger_health_glance(
+  snap,
+  "screener-ledger-h",
+  "/desk/book",
+  "Book ledger →",
+  "Ledger parse check before chasing scan names. Bad lines are named. Good rows stay. Not a gate."
+) }}
+
+{# MonsterDeveloper simplicity: keep first viewport short; policy lines stay available. #}
+{% set policy_meta = snap.policy_honesty_meta|default('crypto · exits · AI · gates · fees') %}
+{% set policy_warn = snap.policy_honesty_warn|default(false) %}
+<details class="policy-honesty{% if policy_warn %} warn{% endif %}" id="policy-honesty"{% if policy_warn %} open{% endif %}>
+  <summary>Policy honesty <span class="meta">{{ policy_meta }}</span></summary>
+  <p class="sub">Display-only rules. Not new entry gates. Ops keeps the toggles.</p>
+
+{{ crypto_policy_glance(
+  snap,
+  "screener-crypto-h",
+  "#crypto-h",
+  "Crypto list ↓",
+  "Live buys stay BTC/ETH · one slot · ±10% exits — leaders below are research, not auto-buy."
+) }}
+
+{{ exit_policy_glance(
+  snap,
+  "screener-exit-h",
+  "/desk/book",
+  "Book →",
+  "Stock exit bands before chasing scan names — TP +8% / SL −5% / rotate ≥+5%. Not ATR."
+) }}
+
+{{ earnings_blackout_glance(
+  snap,
+  "screener-earnings-h",
+  "#brk-h",
+  "Breakouts ↓",
+  "Stock blackout 2d/1d; empty/bad Yahoo → allow (suspect); crypto exempt."
+) }}
+
+{{ ai_mode_glance(
+  snap,
+  "screener-ai-h",
+  "/desk/ops#ops-ai-mode",
+  "Ops AI →",
+  "AI path before chasing scan names — off / validate / full + multi-role. Rules first."
+) }}
+
+{{ ai_roles_glance(
+  snap,
+  "screener-ai-roles-h",
+  "/desk/ideas",
+  "Ideas →",
+  "Before chasing a scan name — multi-role bull/bear/risk; disagreement or risk veto → HOLD."
+) }}
+
+{{ laya_glance(
+  snap,
+  "screener-laya-h",
+  "/desk/ops#ops-ai-mode",
+  "Ops AI →",
+  "Beside opportunities — last advisory vs this scan clock; clash if they disagree. Fail-open; not a gate."
+) }}
+
+{{ ai_debate_glance(
+  snap,
+  "screener-ai-debate-h",
+  "/desk/ideas#debate-h",
+  "Ideas debates →",
+  "Beside opportunities — recent validate memory; not a research score."
+) }}
+
+{{ ai_validate_scope_glance(
+  snap,
+  "screener-ai-scope-h",
+  "/desk/ops#ops-ai-mode",
+  "Ops AI →",
+  "Before chasing scan AI tags — only top N get LLM; rest keep scanner score."
+) }}
+
+{{ session_glance(
+  snap,
+  "screener-session-h",
+  "/desk",
+  "Overview →",
+  "UTC session before chasing breakouts — weekend is crypto-only."
+) }}
+
+{{ equity_hours_glance(
+  snap,
+  "screener-equity-hours-h",
+  "/desk",
+  "Overview →",
+  "Live US vs Xetra before treating .DE like US hours — crypto stays 24/7."
+) }}
+
+{{ breakout_guard_glance(
+  snap,
+  "screener-breakout-h",
+  "#brk-h",
+  "Breakouts →",
+  "Before chasing the breakout list — AI BUY required, LOW blocked, mild pullback band."
+) }}
+
+{{ loss_rotation_glance(
+  snap,
+  "screener-loss-rot-h",
+  "/desk/book",
+  "Book →",
+  "Before chasing a scan name — losers stay; only winners past the rotate hurdle free a slot."
+) }}
+
+{{ stale_rotation_glance(
+  snap,
+  "screener-stale-rot-h",
+  "/desk/book",
+  "Book →",
+  "Before calling a name stale — only off the full scan list, and only with a top-N replacement."
+) }}
+
+{{ junk_filter_glance(
+  snap,
+  "screener-junk-h",
+  "#crypto-h",
+  "Crypto list ↓",
+  "Before trusting movers — no stables/leveraged/noise; crypto buys need ≥ $1 (ESP/BANK)."
+) }}
+
+{{ universe_discovery_glance(
+  snap,
+  "screener-universe-h",
+  "#rec-h",
+  "Recs ↓",
+  "Before treating Yahoo movers as buys — curated US+DE list only; discovery ≠ auto-buy."
+) }}
+
+{{ atr_display_glance(
+  snap,
+  "screener-atr-h",
+  "#rec-h",
+  "Recs ↓",
+  "Before treating Screener ATR / R:R notes as stops — display only; live exits use TP/SL."
+) }}
+
+{{ entry_slots_glance(
+  snap,
+  "screener-entry-slots-h",
+  "/desk/screener",
+  "Lists →",
+  "Beside opportunity lists — stock score band + crypto/stock interleave. Display only."
+) }}
+
+{{ promote_contract_glance(
+  snap,
+  "screener-promote-contract-h",
+  "/desk/ops#ops-promote",
+  "Ops promote →",
+  "Before chasing scan names under promote — entry filter only; exits stay exit_policy."
+) }}
+
+{{ gate_roles_glance(
+  snap,
+  "screener-gate-roles-h",
+  "/desk/ops#ops-regime",
+  "Ops gates →",
+  "Beside opportunity lists — regime abs · RS rel · breadth scan A/D; starve→RS off first."
+) }}
+
+{{ gate_params_glance(
+  snap,
+  "screener-gate-params-h",
+  "/desk/ops#ops-regime",
+  "Ops gates →",
+  "Beside lists — SMA / RS lookback / scan A/D mins; fail-open on short bars. Display only."
+) }}
+
+{{ book_limits_glance(
+  snap,
+  "screener-book-limits-h",
+  "/desk/ops#ops-max-pos",
+  "Ops book →",
+  "Slots · min hold · fee preset before chasing scan names — packaging ≠ edge."
+) }}
+
+{{ rebuy_cooldown_glance(
+  snap,
+  "screener-rebuy-h",
+  "/desk/ops#ops-min-hold",
+  "Ops hold →",
+  "Same-symbol rebuy lock before chasing scan names — SCHW flip-flop / fee lesson."
+) }}
+
+{{ daily_loss_glance(
+  snap,
+  "screener-day-loss-h",
+  "/desk#pretrade-h",
+  "Pre-trade →",
+  "UTC-day realized vs −2% halt before chasing scan names — headroom before FAIL."
+) }}
+
+{{ concentration_glance(
+  snap,
+  "screener-conc-h",
+  "/desk/book",
+  "Book →",
+  "Largest name vs 30% entry cap before chasing scan names — headroom before size blocks."
+) }}
+
+{{ listed_fund_overlap_glance(
+  snap,
+  "screener-fund-overlap-h",
+  "/desk/book",
+  "Book →",
+  "Same-theme ETF/ETC doubles (gold · silver · US equity) — name overlap ≠ single-name cap. Display only."
+) }}
+
+{{ post_sl_cooldown_glance(
+  snap,
+  "screener-post-sl-h",
+  "/desk#pretrade-h",
+  "Pre-trade →",
+  "After SL, ≥4h buy block before chasing scan names — anti revenge refill."
+) }}
+
+{{ loop_cadence_glance(
+  snap,
+  "screener-loop-cadence-h",
+  "/desk/ops#ops-scan-trade",
+  "Ops cadence →",
+  "Scan vs trade sleep before chasing scan names — floors ≥15m / ≥5m. Packaging ≠ edge."
+) }}
+
+{{ improve_tick_glance(
+  snap,
+  "screener-improve-tick-h",
+  "/desk/ops#logs-h",
+  "Ops logs →",
+  "Last Cursor improve tick vs hourly cadence — fresh ≤75m · aging ≤3h · else stale. Display only."
+) }}
+
+{{ fee_allowance_glance(
+  snap,
+  "screener-fee-allowance-h",
+  "/desk/ops#ops-fee-preset",
+  "Ops fees →",
+  "Free monthly legs before chasing scan names — Revolut-like quota; crypto fees not modeled. Not a gate."
+) }}
+
+{{ fee_burn_glance(
+  snap,
+  "screener-fee-burn-h",
+  "/desk/ops#ops-fee-preset",
+  "Ops fees →",
+  "Fee drag vs start and realized P&L before chasing scan names — high (≥2% or fees>P&L) suggests reset or longer holds."
+) }}
+
+{{ stuck_capital_glance(
+  snap,
+  "screener-stuck-h",
+  "/desk/book",
+  "Book →",
+  "Past min-hold underwater before chasing scan names — capital trapped until TP/SL/trim."
+) }}
+
+{{ min_hold_lock_glance(
+  snap,
+  "screener-min-hold-lock-h",
+  "/desk/ops#ops-min-hold",
+  "Ops hold →",
+  "Lots still inside min-hold before chasing scan names — cannot rotate/trim yet. Not a gate."
+) }}
+
+{{ postmortem_glance(
+  snap,
+  "screener-post-h",
+  "/desk/book#post-h",
+  "Book rounds →",
+  "Newest closed round before chasing scan names — memory before FOMO. Not a gate."
+) }}
+
+</details>
+
+<section class="block" aria-labelledby="rec-h">
+  <h2 id="rec-h">Recommendations</h2>
+  {% if snap.recommendations %}
+  <ul class="recs">
+    {% for r in snap.recommendations %}
+    <li>
+      <span class="rank">#{{ r.rank }}</span>
+      {{ ticker(r.symbol, r.name) }}
+      <span class="meta">{{ r.asset_class }} · {{ r.strategy }} · {% if r.score is none %}n/a score{% else %}score {{ "%.1f"|format(r.score) }}{% endif %}</span>
+      <span class="why">{{ r.reasoning }}</span>
+      {% if r.risk_note %}
+      <span class="meta risk {% if r.risk_rr_ok %}up{% elif r.risk_rr_ok is sameas false %}down{% endif %}">{{ r.risk_note }}</span>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="empty">No ranked recommendations yet — wait for the next scanner pass.</p>
+  {% endif %}
+</section>
+
+<section class="split" aria-label="Leaders and breakouts">
+  <div class="block" aria-labelledby="crypto-h">
+    <h2 id="crypto-h">Crypto leaders</h2>
+    {% if snap.crypto_leaders %}
+    <ul class="leaders">
+      {% for c in snap.crypto_leaders %}
+      <li>
+        {{ ticker(c.symbol, c.name) }}
+        {% if c.change_24h is none %}
+        <span class="meta">n/a 24h · {% if c.score is none %}n/a score{% else %}score {{ "%.0f"|format(c.score) }}{% endif %}</span>
+        {% else %}
+        <span class="meta {% if c.change_24h >= 0 %}up{% else %}down{% endif %}">
+          {{ "%+.1f"|format(c.change_24h) }}% 24h · {% if c.score is none %}n/a score{% else %}score {{ "%.0f"|format(c.score) }}{% endif %}
+        </span>
+        {% endif %}
+        {% if c.risk_note %}<span class="meta risk">{{ c.risk_note }}</span>{% endif %}
+        <span class="amt">{% if c.price is none %}n/a{% else %}€{{ "{:,.4g}".format(c.price) }}{% endif %}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No crypto leaders in the latest scan archive.</p>
+    {% endif %}
+  </div>
+  <div class="block" aria-labelledby="brk-h">
+    <h2 id="brk-h">Stock breakouts</h2>
+    {% if snap.stock_breakouts %}
+    <ul class="leaders">
+      {% for s in snap.stock_breakouts %}
+      <li>
+        {{ ticker(s.symbol, s.name) }}
+        <span class="meta">{{ s.sector }} · {{ s.strength }} · {% if s.pct_from_high is none %}n/a from high{% else %}{{ "%.1f"|format(s.pct_from_high) }}% from high{% endif %}</span>
+        {% if s.risk_note %}<span class="meta risk">{{ s.risk_note }}</span>{% endif %}
+        <span class="amt">{% if s.price is none %}n/a{% else %}€{{ "{:,.2f}".format(s.price) }}{% endif %}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">{% if snap.weekend_mode %}Weekend: stock breakouts paused (crypto still scans).{% else %}No equity breakout data in the latest scan.{% endif %}</p>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

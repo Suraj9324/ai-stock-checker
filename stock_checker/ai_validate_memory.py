@@ -1,0 +1,359 @@
+"""Ring buffer of recent AI validate debates (FinRobot / TradingAgents style).
+
+Persists bull/bear/risk notes from multi-role validate so Ideas can show a
+transcript. Display only — not an entry gate. Lives under data/ (gitignored).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+VALIDATE_MEMORY_FILE = "ai_validate_memory.json"
+VALIDATE_MEMORY_CAP = 24
+IDEAS_LIMIT = 8
+
+
+def _default_data_dir() -> Path:
+    return Path(os.getenv("DATA_DIR", "data"))
+
+
+def validate_memory_path(data_dir: Path | str) -> Path:
+    return Path(data_dir) / VALIDATE_MEMORY_FILE
+
+
+def _coerce_validate_memory_cap(
+    value: object, default: int = VALIDATE_MEMORY_CAP
+) -> int:
+    """Ring retention length, or ``default`` when bool/gap.
+
+    FinRobot + tradermonty #700/#655 + xang1234/portfolio AI: ``int(True)→1``
+    / ``False→0→max(1,0)→1`` must not invent a one-row debate ring (Ops audit
+    / soft-allow retention peer).
+    """
+    from stock_checker.entry_slots import coerce_nonneg_int
+
+    n = coerce_nonneg_int(value)
+    if n is None:
+        return int(default)
+    return n
+
+
+def _coerce_recent_debates_limit(
+    value: object, default: int = IDEAS_LIMIT
+) -> int:
+    """Ideas transcript length, or ``default`` when bool/gap.
+
+    FinRobot + tradermonty #700/#655 + xang1234/portfolio AI: ``int(True)→1``
+    must not invent a one-row Ideas strip; ``False→0`` must not wipe the
+    transcript.
+    """
+    from stock_checker.entry_slots import coerce_nonneg_int
+
+    n = coerce_nonneg_int(value)
+    if n is None:
+        return int(default)
+    return n
+
+
+_DEFAULT_CLIP_CHARS = 200
+_DEFAULT_REASON_LINES = 8
+
+
+def _coerce_clip_chars(
+    value: object, default: int = _DEFAULT_CLIP_CHARS
+) -> int:
+    """Positive note/reason char ceiling, or ``default`` when bool/gap/≤0.
+
+    FinRobot + tradermonty #700/#655 + xang1234/portfolio AI: ``True→1``
+    must not invent a one-char Ideas note (``T…``); ``False→0`` must not
+    wipe every bull/bear/risk note via ``s[: -1]``.
+    """
+    from stock_checker.entry_slots import coerce_nonneg_int
+
+    n = coerce_nonneg_int(value)
+    if n is None or n <= 0:
+        return int(default)
+    return n
+
+
+def _coerce_clip_reason_lines(
+    value: object, default: int = _DEFAULT_REASON_LINES
+) -> int:
+    """Non-negative reason-list length, or ``default`` when bool/gap.
+
+    FinRobot + tradermonty #700/#655 + xang1234/portfolio AI: ``True→1``
+    must not invent a one-line reason strip; ``False→0`` must not wipe the
+    debate reasons (Ideas limit / soft-allow strip peer — retention caps
+    already refused; reason clip ceilings were still open).
+    """
+    from stock_checker.entry_slots import coerce_nonneg_int
+
+    n = coerce_nonneg_int(value)
+    if n is None:
+        return int(default)
+    return n
+
+
+def _clip(text: Any, n: object = _DEFAULT_CLIP_CHARS) -> str:
+    limit = _coerce_clip_chars(n)
+    s = str(text or "").strip()
+    if len(s) <= limit:
+        return s
+    return s[: limit - 1] + "…"
+
+
+def _score(raw: Any) -> int | None:
+    """Refuse bool/gap/NaN so Ideas cannot invent score 0 / ``True→1``.
+
+    Missing or unreadable → ``None`` (staskh dash-for-null / portfolio AI);
+    never ``float(raw or 0)`` which turned ``None``/``False`` into flat 0.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v != v or v in (float("inf"), float("-inf")):  # NaN / inf
+        return None
+    return max(-100, min(100, int(v)))
+
+
+def _clip_reasons(
+    raw: Any,
+    *,
+    max_lines: object = _DEFAULT_REASON_LINES,
+    line_n: object = _DEFAULT_CLIP_CHARS,
+) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    # tradermonty #700/#655 + FinRobot/xang1234: refuse bool —
+    # True→1 line / True→1 char must not invent a tiny reason strip.
+    lim = _coerce_clip_reason_lines(max_lines)
+    out: list[str] = []
+    for line in raw[:lim]:
+        clipped = _clip(line, line_n)
+        if clipped:
+            out.append(clipped)
+    return out
+
+
+def load_ai_validate_memory(data_dir: Path | str) -> list[dict[str, Any]]:
+    path = validate_memory_path(data_dir)
+    if not path.is_file():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    events = raw.get("events") if isinstance(raw, dict) else None
+    if not isinstance(events, list):
+        return []
+    return [e for e in events if isinstance(e, dict)]
+
+
+def recent_ai_debates(
+    data_dir: Path | str, *, limit: int = IDEAS_LIMIT
+) -> list[dict[str, Any]]:
+    """Newest-first debates for Ideas (display only)."""
+    lim = max(0, _coerce_recent_debates_limit(limit))
+    events = load_ai_validate_memory(data_dir)
+    return list(reversed(events[-lim:])) if lim else []
+
+
+def latest_ai_actions(data_dir: Path | str) -> dict[str, str]:
+    """Newest validate action per symbol (display only).
+
+    Walks the ring buffer oldest→newest so the last event wins. Values are
+    BUY / HOLD / SELL. Empty when no memory — Book Group Matrix uses this
+    for AI debate mark clusters (FinRobot / portfolio AI).
+    """
+    out: dict[str, str] = {}
+    for e in load_ai_validate_memory(data_dir):
+        if not isinstance(e, dict):
+            continue
+        sym = str(e.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        action = str(e.get("action") or "HOLD").upper()
+        if action not in {"BUY", "SELL", "HOLD"}:
+            action = "HOLD"
+        out[sym] = action
+    return out
+
+
+def latest_ai_confidences(data_dir: Path | str) -> dict[str, str]:
+    """Newest validate confidence per symbol (display only).
+
+    Walks oldest→newest so the last event wins. Values are HIGH / MEDIUM /
+    LOW. Symbols with blank/unknown confidence are omitted (Book treats
+    them as none). FinRobot + portfolio AI confidence cluster for Group
+    Matrix — not a research score and not a gate.
+    """
+    out: dict[str, str] = {}
+    for e in load_ai_validate_memory(data_dir):
+        if not isinstance(e, dict):
+            continue
+        sym = str(e.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        conf = str(e.get("confidence") or "").upper()
+        if conf not in {"HIGH", "MEDIUM", "LOW"}:
+            out.pop(sym, None)
+            continue
+        out[sym] = conf
+    return out
+
+
+def latest_ai_gated(data_dir: Path | str) -> dict[str, bool]:
+    """Newest multi-role gated flag per symbol (display only).
+
+    Walks oldest→newest so the last event wins. True = bull/bear/risk veto
+    forced HOLD; False = debate kept without role veto. Symbols with no
+    memory are omitted (Book treats them as none). FinRobot roles cluster
+    for Group Matrix — not a research score and not a gate.
+    """
+    out: dict[str, bool] = {}
+    for e in load_ai_validate_memory(data_dir):
+        if not isinstance(e, dict):
+            continue
+        sym = str(e.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        out[sym] = bool(e.get("multi_role_gated"))
+    return out
+
+
+def summarize_ai_debates(data_dir: Path | str) -> dict[str, Any]:
+    """Compact counts from the validate ring buffer (display only).
+
+    FinRobot-style research memory: BUY/HOLD/SELL mix + multi-role gated
+    count + newest symbol/action/confidence. Not a research score and not
+    an entry gate.
+    """
+    events = load_ai_validate_memory(data_dir)
+    empty: dict[str, Any] = {
+        "count": 0,
+        "buy": 0,
+        "hold": 0,
+        "sell": 0,
+        "gated": 0,
+        "kept": 0,
+        "dropped": 0,
+        "latest_symbol": "",
+        "latest_action": "",
+        "latest_confidence": "",
+        "latest_at": "",
+    }
+    if not events:
+        return empty
+
+    buy = hold = sell = gated = kept = dropped = 0
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        action = str(e.get("action") or "HOLD").upper()
+        if action == "BUY":
+            buy += 1
+        elif action == "SELL":
+            sell += 1
+        else:
+            hold += 1
+        if e.get("multi_role_gated"):
+            gated += 1
+        if e.get("kept") is True:
+            kept += 1
+        elif e.get("kept") is False:
+            dropped += 1
+
+    latest = events[-1] if isinstance(events[-1], dict) else {}
+    conf = str(latest.get("confidence") or "").upper()
+    if conf not in {"HIGH", "MEDIUM", "LOW"}:
+        conf = ""
+    return {
+        "count": len(events),
+        "buy": buy,
+        "hold": hold,
+        "sell": sell,
+        "gated": gated,
+        "kept": kept,
+        "dropped": dropped,
+        "latest_symbol": str(latest.get("symbol") or "").strip().upper(),
+        "latest_action": str(latest.get("action") or "HOLD").upper(),
+        "latest_confidence": conf,
+        "latest_at": str(latest.get("at") or "").strip(),
+    }
+
+
+def record_ai_validate(
+    data_dir: Path | str,
+    ai_result: dict[str, Any] | None,
+    *,
+    symbol: str | None = None,
+    kept: bool | None = None,
+    cap: int = VALIDATE_MEMORY_CAP,
+) -> None:
+    """Append one validate debate; keep the newest ``cap`` rows."""
+    if not isinstance(ai_result, dict) or not ai_result:
+        return
+    sym = str(symbol or ai_result.get("symbol") or "").strip().upper()
+    if not sym:
+        return
+    action = str(ai_result.get("action") or "HOLD").upper()
+    if action not in {"BUY", "SELL", "HOLD"}:
+        action = "HOLD"
+    confidence = str(ai_result.get("confidence") or "").upper()
+    if confidence not in {"HIGH", "MEDIUM", "LOW"}:
+        confidence = ""
+    reasons = ai_result.get("reasons") if isinstance(ai_result.get("reasons"), list) else []
+    consensus = _clip(ai_result.get("reasoning") or "")
+    if not consensus and reasons:
+        # Multi-role packs consensus last; single-role uses first reason.
+        consensus = _clip(reasons[-1] if len(reasons) > 1 else reasons[0])
+    event = {
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "symbol": sym,
+        "action": action,
+        "confidence": confidence,
+        "score": _score(ai_result.get("score")),
+        "parse_mode": str(ai_result.get("parse_mode") or ""),
+        "multi_role_gated": bool(ai_result.get("multi_role_gated")),
+        "bull_bias": str(ai_result.get("bull_bias") or "").upper(),
+        "bear_bias": str(ai_result.get("bear_bias") or "").upper(),
+        "risk_ok": ai_result.get("risk_ok"),
+        "bull_note": _clip(ai_result.get("bull_note") or ""),
+        "bear_note": _clip(ai_result.get("bear_note") or ""),
+        "risk_note": _clip(ai_result.get("risk_note") or ""),
+        "consensus": consensus,
+        "reasons": _clip_reasons(reasons),
+        "kept": None if kept is None else bool(kept),
+    }
+    # Recover notes from reasons when multi-role fields missing (older payloads).
+    if not event["bull_note"] and reasons:
+        for line in reasons:
+            s = str(line or "")
+            if s.lower().startswith("bull:"):
+                event["bull_note"] = _clip(s.split(":", 1)[-1])
+            elif s.lower().startswith("bear:"):
+                event["bear_note"] = _clip(s.split(":", 1)[-1])
+            elif s.lower().startswith("risk:"):
+                event["risk_note"] = _clip(s.split(":", 1)[-1])
+    path = validate_memory_path(data_dir)
+    events = load_ai_validate_memory(data_dir)
+    events.append(event)
+    # Ops audit / soft-allow retention already refused bool; AI debate ring
+    # was still open to int(True)→1 / False→0→max(1,0)→1.
+    keep = max(1, _coerce_validate_memory_cap(cap))
+    events = events[-keep:]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"updated_at": events[-1]["at"], "events": events}, indent=2)
+            + "\n"
+        )
+    except OSError:
+        pass

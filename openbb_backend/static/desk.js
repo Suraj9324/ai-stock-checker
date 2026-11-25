@@ -1,0 +1,284 @@
+/*! paper desk — countdown + a11y helpers (no deps) */
+(function () {
+  "use strict";
+
+  var skip = document.querySelector("a.skip");
+  if (skip) {
+    skip.addEventListener("click", function () {
+      var main = document.getElementById("main");
+      if (main) {
+        window.setTimeout(function () {
+          main.focus();
+        }, 0);
+      }
+    });
+  }
+
+  var form = document.querySelector("[data-ops-config]");
+  if (form) {
+    var status = document.getElementById("ops-config-status");
+    var saveBtn = form.querySelector(".ops-save");
+
+    function setStatus(text, kind) {
+      if (!status) {
+        return;
+      }
+      status.textContent = text || "";
+      status.classList.remove("is-ok", "is-err");
+      if (kind) {
+        status.classList.add(kind);
+      }
+    }
+
+    function readConfigBody() {
+      var modeEl = document.getElementById("ops-ai-mode");
+      var modelEl = document.getElementById("ops-ai-model");
+      var multiEl = document.getElementById("ops-multi-role");
+      var regimeEl = document.getElementById("ops-regime");
+      var rsEl = document.getElementById("ops-rs");
+      var breadthEl = document.getElementById("ops-breadth");
+      var promoteEl = document.getElementById("ops-promote");
+      var feeEl = document.getElementById("ops-fee-preset");
+      var maxEl = document.getElementById("ops-max-pos");
+      var holdEl = document.getElementById("ops-min-hold");
+      return {
+        ai_mode: modeEl ? modeEl.value : "off",
+        ai_model: modelEl ? String(modelEl.value || "").trim() : "",
+        ai_multi_role: multiEl ? !!multiEl.checked : true,
+        regime_gate: regimeEl ? !!regimeEl.checked : true,
+        rs_gate: rsEl ? !!rsEl.checked : true,
+        breadth_gate: breadthEl ? !!breadthEl.checked : true,
+        promote_experiment_strategy: promoteEl ? !!promoteEl.checked : false,
+        fee_preset: feeEl ? feeEl.value : "revolut_standard",
+        max_positions: maxEl ? parseInt(maxEl.value, 10) : 5,
+        min_hold_hours: holdEl ? parseFloat(holdEl.value) : 24,
+      };
+    }
+
+    function parseJsonResponse(res) {
+      // xang1234 #621: a non-JSON 502/503 body is still an HTTP failure —
+      // do not fall through to the network catch as if the backend were down.
+      return res
+        .json()
+        .then(function (data) {
+          return { ok: res.ok, status: res.status, data: data };
+        })
+        .catch(function () {
+          return {
+            ok: res.ok,
+            status: res.status,
+            data: { detail: "Save failed (" + res.status + ")" },
+          };
+        });
+    }
+
+    function putConfig(body) {
+      setStatus("Saving…", null);
+      return fetch("/desk/api/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(body),
+      })
+        .then(parseJsonResponse)
+        .then(function (result) {
+          if (!result.ok) {
+            var detail =
+              (result.data && (result.data.detail || result.data.note)) ||
+              "Save failed (" + result.status + ")";
+            setStatus(String(detail), "is-err");
+            return;
+          }
+          var auditBit =
+            result.data.audit_outcome === "accepted"
+              ? " · audited"
+              : result.data.action_id
+                ? " · audit " + String(result.data.audit_outcome || "?")
+                : "";
+          // xang1234 #636: speak which knobs this Save affected (not bare AI mode).
+          var impactBit =
+            result.data.changed_bit
+              ? " · " + String(result.data.changed_bit)
+              : "";
+          setStatus(
+            "Saved · AI " +
+              result.data.ai_mode +
+              impactBit +
+              auditBit +
+              " · applies on next trader loop",
+            "is-ok"
+          );
+        });
+    }
+
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      var body = readConfigBody();
+      if (saveBtn) {
+        saveBtn.disabled = true;
+      }
+      setStatus("Checking Save impact…", null);
+
+      // xang1234 #636: dry-run first; hot book/fee/promote asks confirm before write.
+      fetch("/desk/api/config?dry_run=1", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify(body),
+      })
+        .then(parseJsonResponse)
+        .then(function (preview) {
+          if (!preview.ok) {
+            var pdetail =
+              (preview.data && (preview.data.detail || preview.data.note)) ||
+              "Preview failed (" + preview.status + ")";
+            setStatus(String(pdetail), "is-err");
+            return;
+          }
+          if (preview.data && preview.data.needs_confirm) {
+            var msg =
+              String(preview.data.confirm || "").trim() ||
+              "Save moves live paper risk. Continue?";
+            if (!window.confirm(msg)) {
+              setStatus("Save cancelled — hot Δ not applied", null);
+              return;
+            }
+          }
+          return putConfig(body);
+        })
+        .catch(function () {
+          setStatus("Network error — is openbb-backend up?", "is-err");
+        })
+        .finally(function () {
+          if (saveBtn) {
+            saveBtn.disabled = false;
+          }
+        });
+    });
+  }
+
+  var logRoot = document.querySelector("[data-ops-logs]");
+  if (logRoot) {
+    var sourceEl = document.getElementById("ops-log-source");
+    var viewEl = document.getElementById("ops-log-view");
+    var metaEl = document.getElementById("ops-log-meta");
+    var es = null;
+    var stickBottom = true;
+
+    function setMeta(text) {
+      if (metaEl) {
+        metaEl.textContent = text || "";
+      }
+    }
+
+    function appendLines(text) {
+      if (!viewEl || !text) {
+        return;
+      }
+      viewEl.textContent += text;
+      if (viewEl.textContent.length > 400000) {
+        viewEl.textContent = viewEl.textContent.slice(-300000);
+      }
+      if (stickBottom) {
+        viewEl.scrollTop = viewEl.scrollHeight;
+      }
+    }
+
+    if (viewEl) {
+      viewEl.addEventListener("scroll", function () {
+        var gap = viewEl.scrollHeight - viewEl.scrollTop - viewEl.clientHeight;
+        stickBottom = gap < 48;
+      });
+    }
+
+    function connect() {
+      if (!sourceEl || !viewEl) {
+        return;
+      }
+      if (es) {
+        es.close();
+        es = null;
+      }
+      var source = sourceEl.value || "trader";
+      viewEl.textContent = "";
+      stickBottom = true;
+      setMeta("Connecting " + source + "…");
+      es = new EventSource("/desk/api/logs/" + encodeURIComponent(source) + "/stream");
+      es.onopen = function () {
+        setMeta(source + " · live");
+      };
+      es.onmessage = function (ev) {
+        appendLines((ev.data || "") + "\n");
+      };
+      es.addEventListener("logerror", function (ev) {
+        if (ev && ev.data) {
+          setMeta("Error: " + ev.data);
+        }
+      });
+      es.onerror = function () {
+        if (es && es.readyState === EventSource.CLOSED) {
+          setMeta(source + " · disconnected");
+        } else {
+          setMeta(source + " · reconnecting…");
+        }
+      };
+    }
+
+    if (sourceEl) {
+      sourceEl.addEventListener("change", connect);
+    }
+    connect();
+    window.addEventListener("beforeunload", function () {
+      if (es) {
+        es.close();
+      }
+    });
+  }
+
+  var el = document.getElementById("refresh-eta");
+  if (!el) {
+    return;
+  }
+
+  // Paper desk: marks/scans move slowly — default 5 minutes (was 60s).
+  var raw = el.getAttribute("data-seconds");
+  var total = parseInt(raw, 10);
+  if (!isFinite(total) || total < 30 || total > 3600) {
+    total = 300;
+  }
+
+  var left = total;
+
+  function formatLeft(sec) {
+    if (sec >= 60) {
+      var m = Math.floor(sec / 60);
+      var s = sec % 60;
+      return m + "m " + (s < 10 ? "0" : "") + s + "s";
+    }
+    return sec + "s";
+  }
+
+  function paint() {
+    el.textContent = formatLeft(left);
+  }
+
+  function reloadSafe() {
+    var path = window.location.pathname || "/desk";
+    if (path.indexOf("/desk") !== 0) {
+      path = "/desk";
+    }
+    window.location.assign(path);
+  }
+
+  paint();
+
+  window.setInterval(function () {
+    if (document.hidden) {
+      return;
+    }
+    left -= 1;
+    if (left <= 0) {
+      reloadSafe();
+      return;
+    }
+    paint();
+  }, 1000);
+})();

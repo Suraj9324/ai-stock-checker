@@ -1,0 +1,102 @@
+# OpenBB Pro workspace
+
+Verified working via Chrome MCP (2026-07-25 CEST).
+
+**Earnings dashboard:** [Earnings Update](https://pro.openbb.co/app/37a492ef-62d8-49ec-b08d-f01d663ad45a)
+
+## Local paper desk (browser)
+
+No OpenBB account needed — open the built-in multi-screen UI:
+
+**http://127.0.0.1:7779/desk**
+
+Screens (inspired by xang1234/stock-screener’s Daily / Scan / Breadth / Ops flow, kept tiny & vanilla):
+
+| Path | Screen |
+|------|--------|
+| `/desk` | Overview — equity + top holdings + scan pulse |
+| `/desk/charts` | D3 charts — equity, allocation, since-buy paths, relative prices |
+| `/desk/screener` | Recommendations, crypto leaders, breakouts |
+| `/desk/breadth` | Session, exposure, allocation |
+| `/desk/book` | Full holdings + fills |
+| `/desk/ideas` | External GitHub idea watch |
+| `/desk/ops` | Watchdog / runtime |
+
+Includes favicon, skip-link, landmarks, `aria-current` nav, meta description, and CSP (`img-src 'self'`; `connect-src 'self'` for chart JSON). Countdown via local `desk.js`. Charts use **vendored D3 v7** (`static/d3.min.js`, no CDN). JSON: `/desk/api`, charts: `/desk/api/charts`.
+
+**Visual identity:** [DESIGN.md](DESIGN.md) — forest/brass editorial desk; agents use `.cursor/skills/paper-desk-design/`.
+
+
+## Paper desk backend (our data → OpenBB)
+
+We ship a FastAPI custom backend that exposes paper portfolio widgets:
+
+```bash
+docker compose up -d --build openbb-backend
+curl -s http://127.0.0.1:7779/health
+open http://127.0.0.1:7779/desk
+curl -s http://127.0.0.1:7779/widgets.json | head
+```
+
+### Connect in OpenBB Workspace
+
+1. Open [Connections](https://pro.openbb.co/app/connections) → **Connect Backend**
+2. Name: `AI Stock Checker`
+3. URL: `http://127.0.0.1:7779` (backend must be running locally)
+4. Optional header: `X-API-KEY` = value of `OPENBB_BACKEND_API_KEY` in `.env` (if set)
+5. Preflight on your machine (proves our API is fine):
+
+```bash
+./scripts/openbb_connection_check.sh
+```
+
+6. If **Test** spins forever after a green preflight: Chrome/Safari is blocking local-network access from `https://pro.openbb.co` — allow local network for the site, then **Add** (not a backend bug). Ops → **OpenBB Connections** repeats this checklist next to the desk.
+7. Open Apps → **AI Stock Checker Paper Desk**
+
+Widgets:
+
+| Widget | Endpoint |
+|--------|----------|
+| Paper Portfolio Summary | `/portfolio_markdown` |
+| Paper Holdings | `/portfolio_table` |
+| Recent Paper Trades | `/trades_table` |
+| Latest Opportunities | `/opportunities_markdown` |
+
+## Research layer vs execution
+
+| Layer | Tool |
+|-------|------|
+| Execution / scoring | `intelligent-trader` (Docker) |
+| Earnings / filings / Copilot | OpenBB Earnings Update app |
+| Bot state in OpenBB | `openbb-backend` widgets |
+
+Typical friend flow:
+
+1. Signal from paper trader
+2. If HIGH conviction equity → OpenBB Earnings Update + Copilot
+3. Check Paper Desk widgets for fees / concentration
+4. Hold or skip
+
+## Product rules wired in code
+
+- **Earnings blackout:** no new stock entries within 2d before / 1d after earnings on the America/New_York date, not UTC (`earnings_guard.py`); empty Yahoo `earnings_dates` window or a nonempty/junk date (epoch) → allow (suspect fail-open); missing calendar date → allow (fail-open)
+- **Sentiment soft factor:** `news_sentiment` / `openbb_sentiment` / near-earnings penalty in recommender (±10 cap)
+- **Do not** put OpenBB account tokens in compose
+
+## Workspace MCP (agents)
+
+For Cursor / Claude agents to see the live OpenBB UI state:
+
+1. Enable **Workspace MCP Companion** in OpenBB (hamburger menu) and copy the bearer token.
+2. Copy [`.cursor/mcp.json.example`](.cursor/mcp.json.example) → your user MCP config (e.g. `~/.cursor/mcp.json`) and paste the token.
+3. See [OpenBB MCP quickstart](https://docs.openbb.co/agents/workspace-mcp-quickstart).
+
+Never commit a real token. The example file is the shippable half of Phase D; the token stays user-local.
+
+## Example Copilot prompt
+
+> Summarize the Q2 2025 NVDA guidance table on this dashboard in 3 bullets for a paper trader: revenue outlook, margins, and biggest risk signal.
+
+## Agent note
+
+When the user points at `pro.openbb.co`, prefer Chrome MCP to verify/use the live workspace rather than guessing from docs.

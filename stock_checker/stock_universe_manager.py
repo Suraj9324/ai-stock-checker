@@ -1,0 +1,797 @@
+#!/usr/bin/env python3
+"""
+Dynamic stock universe manager.
+Discovers, persists, and manages the full stock universe on disk.
+"""
+
+import json
+from datetime import datetime, timedelta
+from typing import List, Dict
+from pathlib import Path
+
+from stock_checker.german_universe import GERMAN_XETRA_SEED
+from stock_checker.listed_funds import LISTED_FUND_SEED
+from stock_checker.secret_redact import safe_exc_text
+
+# Yahoo US screens are not a Xetra listing file. Compare prune baselines
+# as MIC-lite venues (xang1234 ae9c507), not raw NYSE vs "US" strings.
+_US_VENUE_EXCHANGES = frozenset(
+    {
+        "US",
+        "NASDAQ",
+        "NYSE",
+        "AMEX",
+        "ARCA",
+        "BATS",
+        "NYSEARCA",
+        "XNYS",
+        "XNAS",
+        "ARCX",
+    }
+)
+_XETR_VENUE_EXCHANGES = frozenset({"XETRA", "XETR", "FRA", "GER", "DE"})
+YAHOO_MOVER_SNAPSHOT_VENUE = "US"
+# Weekday breakout batch defaults (weekend uses 100 / 48 inside MarketScanner).
+DEFAULT_SCAN_BATCH_LIMIT = 30
+DEFAULT_SCAN_MAX_AGE_HOURS = 24
+# Cap Yahoo mover adds per discovery call (universe bloat guard).
+DEFAULT_YAHOO_MAX_NEW = 40
+
+
+def _coerce_scan_batch_limit(
+    value: object, default: int = DEFAULT_SCAN_BATCH_LIMIT
+) -> int:
+    """Scan batch size, or ``default`` when bool/gap.
+
+    tradermonty #700/#655 + xang1234/portfolio AI: ``int(True)→1`` must not
+    invent a one-name breakout cycle after Yahoo screen knobs already refused
+    thin mover spends.
+    """
+    from stock_checker.technical_indicators import coerce_nonneg_int
+
+    n = coerce_nonneg_int(value)
+    if n is None or n < 1:
+        return int(default)
+    return n
+
+
+def _coerce_scan_max_age_hours(
+    value: object, default: int = DEFAULT_SCAN_MAX_AGE_HOURS
+) -> int:
+    """Re-scan age hours, or ``default`` when bool/gap.
+
+    tradermonty #700/#655 + xang1234/portfolio AI: ``int(True)→1`` must not
+    invent a 1h "already scanned" band that empties the weekday batch.
+    """
+    from stock_checker.technical_indicators import coerce_nonneg_int
+
+    n = coerce_nonneg_int(value)
+    if n is None or n < 1:
+        return int(default)
+    return n
+
+
+def _coerce_yahoo_max_new(
+    value: object, default: int = DEFAULT_YAHOO_MAX_NEW
+) -> int:
+    """Yahoo mover add cap, or ``default`` when bool/gap.
+
+    tradermonty #700/#655 + xang1234/portfolio AI: ``int(True)→1`` must not
+    invent a one-name universe grow (mover-count peer).
+    """
+    from stock_checker.technical_indicators import coerce_nonneg_int
+
+    n = coerce_nonneg_int(value)
+    if n is None or n < 1:
+        return int(default)
+    return n
+
+
+def listing_venue(symbol: str, exchange: str = "") -> str:
+    """Normalize listing to US / XETR / other (MIC-lite).
+
+    ``.DE`` suffix wins over a stamped US tag so a Yahoo US snapshot cannot
+    deactivate a Xetra row. Unknown exchanges stay distinct from US.
+    """
+    sym = str(symbol or "").strip().upper()
+    if sym.endswith(".DE"):
+        return "XETR"
+    ex = str(exchange or "").strip().upper()
+    if ex in _XETR_VENUE_EXCHANGES:
+        return "XETR"
+    if not ex or ex in _US_VENUE_EXCHANGES:
+        return "US"
+    return ex
+
+
+class StockUniverseManager:
+    """Manage dynamic stock universe with disk persistence."""
+
+    def __init__(self, data_dir: str = "/data"):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(exist_ok=True)
+
+        self.universe_file = self.data_dir / "stock_universe.json"
+        self.scan_history_file = self.data_dir / "stock_scan_history.json"
+
+        # Load or initialize universe
+        self.universe = self._load_universe()
+        self.scan_history = self._load_scan_history()
+
+        # Seed with initial stocks if universe is empty
+        if not self.universe.get("stocks"):
+            self._seed_initial_universe()
+
+    def _load_universe(self) -> Dict:
+        """Load stock universe from disk."""
+        if self.universe_file.exists():
+            try:
+                with open(self.universe_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"⚠️  Error loading universe: {safe_exc_text(e)}")
+                return self._create_empty_universe()
+        return self._create_empty_universe()
+
+    def _create_empty_universe(self) -> Dict:
+        """Create empty universe structure."""
+        return {
+            "last_updated": datetime.now().isoformat(),
+            "total_stocks": 0,
+            "stocks": {},  # symbol -> {"sector": str, "exchange": str, "added": timestamp}
+            "sectors": {},  # sector -> [symbols]
+            "exchanges": {}  # exchange -> [symbols]
+        }
+
+    def _save_universe(self):
+        """Save universe to disk."""
+        self.universe["last_updated"] = datetime.now().isoformat()
+        self.universe["total_stocks"] = len(self.universe["stocks"])
+
+        with open(self.universe_file, "w", encoding="utf-8") as f:
+            json.dump(self.universe, f, indent=2)
+
+    def _load_scan_history(self) -> Dict:
+        """Load scan history from disk."""
+        if self.scan_history_file.exists():
+            try:
+                with open(self.scan_history_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"⚠️  Error loading scan history: {safe_exc_text(e)}")
+                return {"scanned": {}, "last_full_cycle": None}
+        return {"scanned": {}, "last_full_cycle": None}
+
+    def _save_scan_history(self):
+        """Save scan history to disk."""
+        with open(self.scan_history_file, "w", encoding="utf-8") as f:
+            json.dump(self.scan_history, f, indent=2)
+
+    def _seed_initial_universe(self):
+        """Seed with initial comprehensive stock list."""
+        print("🌱 Seeding initial stock universe...")
+
+        initial_stocks = {
+            # US Mega Cap Tech
+            "AAPL": {"sector": "technology", "exchange": "NASDAQ"},
+            "MSFT": {"sector": "technology", "exchange": "NASDAQ"},
+            "GOOGL": {"sector": "technology", "exchange": "NASDAQ"},
+            "AMZN": {"sector": "technology", "exchange": "NASDAQ"},
+            "NVDA": {"sector": "technology", "exchange": "NASDAQ"},
+            "META": {"sector": "technology", "exchange": "NASDAQ"},
+            "TSLA": {"sector": "automotive", "exchange": "NASDAQ"},
+            "ORCL": {"sector": "technology", "exchange": "NYSE"},
+            "ADBE": {"sector": "technology", "exchange": "NASDAQ"},
+            "CRM": {"sector": "technology", "exchange": "NYSE"},
+            "NFLX": {"sector": "entertainment", "exchange": "NASDAQ"},
+            "DIS": {"sector": "entertainment", "exchange": "NYSE"},
+
+            # Semiconductors
+            "AMD": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "INTC": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "QCOM": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "AVGO": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "TSM": {"sector": "semiconductor", "exchange": "NYSE"},
+            "ASML": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "MU": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "AMAT": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "LRCX": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "KLAC": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "MRVL": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "ON": {"sector": "semiconductor", "exchange": "NASDAQ"},
+
+            # AI & Cloud
+            "PLTR": {"sector": "ai", "exchange": "NYSE"},
+            "AI": {"sector": "ai", "exchange": "NYSE"},
+            "SNOW": {"sector": "cloud", "exchange": "NYSE"},
+            "NET": {"sector": "cloud", "exchange": "NYSE"},
+            "DDOG": {"sector": "cloud", "exchange": "NASDAQ"},
+            "CRWD": {"sector": "cybersecurity", "exchange": "NASDAQ"},
+            "ZS": {"sector": "cybersecurity", "exchange": "NASDAQ"},
+            "S": {"sector": "cloud", "exchange": "NYSE"},
+            "PANW": {"sector": "cybersecurity", "exchange": "NASDAQ"},
+            "FTNT": {"sector": "cybersecurity", "exchange": "NASDAQ"},
+
+            # Finance
+            "JPM": {"sector": "banking", "exchange": "NYSE"},
+            "BAC": {"sector": "banking", "exchange": "NYSE"},
+            "GS": {"sector": "banking", "exchange": "NYSE"},
+            "MS": {"sector": "banking", "exchange": "NYSE"},
+            "V": {"sector": "payments", "exchange": "NYSE"},
+            "MA": {"sector": "payments", "exchange": "NYSE"},
+            "AXP": {"sector": "payments", "exchange": "NYSE"},
+            "C": {"sector": "banking", "exchange": "NYSE"},
+            "WFC": {"sector": "banking", "exchange": "NYSE"},
+            "BLK": {"sector": "asset_management", "exchange": "NYSE"},
+            "SCHW": {"sector": "brokerage", "exchange": "NYSE"},
+            "USB": {"sector": "banking", "exchange": "NYSE"},
+
+            # Energy
+            "XOM": {"sector": "energy", "exchange": "NYSE"},
+            "CVX": {"sector": "energy", "exchange": "NYSE"},
+            "COP": {"sector": "energy", "exchange": "NYSE"},
+            "SLB": {"sector": "energy", "exchange": "NYSE"},
+            "OXY": {"sector": "energy", "exchange": "NYSE"},
+            "EOG": {"sector": "energy", "exchange": "NYSE"},
+            "MPC": {"sector": "energy", "exchange": "NYSE"},
+            "PSX": {"sector": "energy", "exchange": "NYSE"},
+            "VLO": {"sector": "energy", "exchange": "NYSE"},
+            "HAL": {"sector": "energy", "exchange": "NYSE"},
+            "BKR": {"sector": "energy", "exchange": "NASDAQ"},
+
+            # Consumer
+            "WMT": {"sector": "retail", "exchange": "NYSE"},
+            "TGT": {"sector": "retail", "exchange": "NYSE"},
+            "COST": {"sector": "retail", "exchange": "NASDAQ"},
+            "NKE": {"sector": "apparel", "exchange": "NYSE"},
+            "LULU": {"sector": "apparel", "exchange": "NASDAQ"},
+            "HD": {"sector": "retail", "exchange": "NYSE"},
+            "LOW": {"sector": "retail", "exchange": "NYSE"},
+            "MCD": {"sector": "restaurant", "exchange": "NYSE"},
+            "SBUX": {"sector": "restaurant", "exchange": "NASDAQ"},
+            "CMG": {"sector": "restaurant", "exchange": "NYSE"},
+            "BKNG": {"sector": "travel", "exchange": "NASDAQ"},
+            "MAR": {"sector": "hospitality", "exchange": "NASDAQ"},
+
+            # Healthcare
+            "UNH": {"sector": "healthcare", "exchange": "NYSE"},
+            "JNJ": {"sector": "healthcare", "exchange": "NYSE"},
+            "LLY": {"sector": "pharma", "exchange": "NYSE"},
+            "ABBV": {"sector": "pharma", "exchange": "NYSE"},
+            "PFE": {"sector": "pharma", "exchange": "NYSE"},
+            "TMO": {"sector": "healthcare", "exchange": "NYSE"},
+            "ABT": {"sector": "healthcare", "exchange": "NYSE"},
+            "DHR": {"sector": "healthcare", "exchange": "NYSE"},
+            "BMY": {"sector": "pharma", "exchange": "NYSE"},
+            "AMGN": {"sector": "biotech", "exchange": "NASDAQ"},
+            "GILD": {"sector": "biotech", "exchange": "NASDAQ"},
+            "VRTX": {"sector": "biotech", "exchange": "NASDAQ"},
+
+            # Crypto Stocks
+            "COIN": {"sector": "crypto", "exchange": "NASDAQ"},
+            "MSTR": {"sector": "crypto", "exchange": "NASDAQ"},
+            "MARA": {"sector": "crypto", "exchange": "NASDAQ"},
+            "RIOT": {"sector": "crypto", "exchange": "NASDAQ"},
+            "HUT": {"sector": "crypto", "exchange": "NASDAQ"},
+            "CLSK": {"sector": "crypto", "exchange": "NASDAQ"},
+            "BITF": {"sector": "crypto", "exchange": "NASDAQ"},
+            "CIFR": {"sector": "crypto", "exchange": "NASDAQ"},
+
+            # German Xetra (.DE) + a few other EU / ADR names
+            **GERMAN_XETRA_SEED,
+            "SAP": {"sector": "technology", "exchange": "NYSE"},
+            "AIR.PA": {"sector": "aerospace", "exchange": "EURONEXT"},
+            "OR.PA": {"sector": "luxury", "exchange": "EURONEXT"},
+            "MC.PA": {"sector": "luxury", "exchange": "EURONEXT"},
+            "SHEL": {"sector": "energy", "exchange": "NYSE"},
+            "BP": {"sector": "energy", "exchange": "NYSE"},
+
+            # Industrial
+            "BA": {"sector": "aerospace", "exchange": "NYSE"},
+            "CAT": {"sector": "machinery", "exchange": "NYSE"},
+            "DE": {"sector": "agriculture", "exchange": "NYSE"},
+            "GE": {"sector": "industrial", "exchange": "NYSE"},
+            "HON": {"sector": "industrial", "exchange": "NASDAQ"},
+            "LMT": {"sector": "defense", "exchange": "NYSE"},
+            "RTX": {"sector": "defense", "exchange": "NYSE"},
+            "UPS": {"sector": "logistics", "exchange": "NYSE"},
+            "FDX": {"sector": "logistics", "exchange": "NYSE"},
+            "MMM": {"sector": "industrial", "exchange": "NYSE"},
+            "EMR": {"sector": "industrial", "exchange": "NYSE"},
+            "ETN": {"sector": "industrial", "exchange": "NYSE"},
+
+            # Large-cap refresh (2026-08) — liquid names missing from older seed
+            "IBM": {"sector": "technology", "exchange": "NYSE"},
+            "CSCO": {"sector": "technology", "exchange": "NASDAQ"},
+            "ACN": {"sector": "technology", "exchange": "NYSE"},
+            "NOW": {"sector": "cloud", "exchange": "NYSE"},
+            "INTU": {"sector": "software", "exchange": "NASDAQ"},
+            "TXN": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "ADI": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "ISRG": {"sector": "healthcare", "exchange": "NASDAQ"},
+            "SYK": {"sector": "healthcare", "exchange": "NYSE"},
+            "MDT": {"sector": "healthcare", "exchange": "NYSE"},
+            "PEP": {"sector": "consumer", "exchange": "NASDAQ"},
+            "KO": {"sector": "consumer", "exchange": "NYSE"},
+            "PG": {"sector": "consumer", "exchange": "NYSE"},
+            "PM": {"sector": "consumer", "exchange": "NYSE"},
+            "TMUS": {"sector": "telecom", "exchange": "NASDAQ"},
+            "VZ": {"sector": "telecom", "exchange": "NYSE"},
+            "T": {"sector": "telecom", "exchange": "NYSE"},
+            "UBER": {"sector": "travel", "exchange": "NYSE"},
+            "ABNB": {"sector": "travel", "exchange": "NASDAQ"},
+            "SHOP": {"sector": "retail", "exchange": "NYSE"},
+            "MELI": {"sector": "retail", "exchange": "NASDAQ"},
+            "APP": {"sector": "software", "exchange": "NASDAQ"},
+            "ARM": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "SMCI": {"sector": "technology", "exchange": "NASDAQ"},
+            **LISTED_FUND_SEED,
+        }
+
+        for symbol, info in initial_stocks.items():
+            self.add_stock(symbol, info["sector"], info["exchange"])
+
+        self._save_universe()
+        print(f"✅ Seeded {len(initial_stocks)} stocks")
+
+    def ensure_curated_seed(self) -> int:
+        """
+        Merge curated seed into an existing universe (add missing only).
+
+        Safe for live data/: does not delete Yahoo-discovered names.
+        Returns count of newly added symbols.
+        """
+        removed = False
+        for dead in ("PXD",):
+            if self._drop_stock(dead):
+                removed = True
+
+        # Large-cap refresh + liquid US names + German Xetra (same as seed).
+        extras = {
+            "IBM": {"sector": "technology", "exchange": "NYSE"},
+            "CSCO": {"sector": "technology", "exchange": "NASDAQ"},
+            "ACN": {"sector": "technology", "exchange": "NYSE"},
+            "NOW": {"sector": "cloud", "exchange": "NYSE"},
+            "INTU": {"sector": "software", "exchange": "NASDAQ"},
+            "TXN": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "ADI": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "ISRG": {"sector": "healthcare", "exchange": "NASDAQ"},
+            "SYK": {"sector": "healthcare", "exchange": "NYSE"},
+            "MDT": {"sector": "healthcare", "exchange": "NYSE"},
+            "PEP": {"sector": "consumer", "exchange": "NASDAQ"},
+            "KO": {"sector": "consumer", "exchange": "NYSE"},
+            "PG": {"sector": "consumer", "exchange": "NYSE"},
+            "PM": {"sector": "consumer", "exchange": "NYSE"},
+            "TMUS": {"sector": "telecom", "exchange": "NASDAQ"},
+            "VZ": {"sector": "telecom", "exchange": "NYSE"},
+            "T": {"sector": "telecom", "exchange": "NYSE"},
+            "UBER": {"sector": "travel", "exchange": "NYSE"},
+            "ABNB": {"sector": "travel", "exchange": "NASDAQ"},
+            "SHOP": {"sector": "retail", "exchange": "NYSE"},
+            "MELI": {"sector": "retail", "exchange": "NASDAQ"},
+            "APP": {"sector": "software", "exchange": "NASDAQ"},
+            "ARM": {"sector": "semiconductor", "exchange": "NASDAQ"},
+            "SMCI": {"sector": "technology", "exchange": "NASDAQ"},
+            **GERMAN_XETRA_SEED,
+            **LISTED_FUND_SEED,
+        }
+        added = 0
+        for symbol, info in extras.items():
+            if self.add_stock(symbol, info["sector"], info["exchange"]):
+                added += 1
+        if added or removed:
+            self._save_universe()
+        after = len(self.universe.get("stocks") or {})
+        if added or removed:
+            print(f"🌱 Universe seed merge: +{added} (now {after} names)")
+        return added
+
+    def yahoo_discovery_due(self, *, max_age_hours: int | None = None) -> bool:
+        """True when Yahoo movers have never run or last *success* is older than max_age.
+
+        xang1234: a failed fetch does not inherit the success-age throttle.
+        Reused seed age is still shown on the desk. After a fail, retry waits
+        the fail backoff (default 1h) so empty/blocked slices are not refetched
+        every scan cycle (xang1234 dfb6a86).
+        """
+        from stock_checker.yahoo_universe_discovery import (
+            DEFAULT_YAHOO_DISCOVERY_MAX_AGE_HOURS,
+            _coerce_yahoo_max_age_hours,
+            yahoo_discovery_due_from_meta,
+        )
+
+        # Pass through coerce — pre-int(True)→1 bypassed due_from_meta refuse.
+        age_limit = (
+            DEFAULT_YAHOO_DISCOVERY_MAX_AGE_HOURS
+            if max_age_hours is None
+            else _coerce_yahoo_max_age_hours(max_age_hours)
+        )
+        return yahoo_discovery_due_from_meta(
+            self.universe.get("meta"),
+            max_age_hours=age_limit,
+        )
+
+    def discover_yahoo_movers(
+        self,
+        *,
+        per_screen: int = 25,
+        max_new: int = 40,
+        force: bool = False,
+        max_age_hours: int | None = None,
+    ) -> int:
+        """
+        Add Yahoo day gainers/losers/actives into the universe (discovery only).
+
+        Does not buy anything. Caps new adds per call to avoid universe bloat.
+
+        xang1234 #640/#642: fail backoff always holds unused fetch budget —
+        weekend/cycle ``force`` cannot thrash a cooling dead Yahoo (reservation
+        cancelled before dispatch → not spent; do not bump fail streak).
+        Success-age freshness still yields to ``force=True``.
+        """
+        from stock_checker.yahoo_universe_discovery import (
+            bump_yahoo_fail_streak,
+            classify_yahoo_discovery_error,
+            clear_yahoo_discovery_error,
+            clear_yahoo_fail_streak,
+            discover_yahoo_mover_report,
+            list_live_yahoo_screen_claims,
+            screens_bundle_failed,
+            screens_bundle_partial,
+            set_yahoo_discovery_claim_drops,
+            set_yahoo_discovery_claim_live,
+            set_yahoo_discovery_error,
+            set_yahoo_discovery_error_sides,
+            yahoo_fail_plan_held,
+            yahoo_fail_retry_remaining_sec,
+            yahoo_stamp_utc_iso,
+            _coerce_yahoo_mover_count,
+        )
+
+        # Yahoo screen knobs already refuse bool; manager per_screen/max_new
+        # were still open to int(True)→1 quote / one-name grow.
+        per_screen = _coerce_yahoo_mover_count(per_screen)
+        max_new = _coerce_yahoo_max_new(max_new)
+
+        meta = self.universe.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+            self.universe["meta"] = meta
+
+        remain = yahoo_fail_retry_remaining_sec(meta)
+        if remain is not None and remain > 0:
+            # Held backoff: never dispatch — #642 refund before spend.
+            rem = int(remain)
+            if rem < 60:
+                wait = "<1m"
+            elif rem < 3600:
+                wait = f"{rem // 60}m"
+            else:
+                wait = f"{rem // 3600}h"
+            print(f"   📡 Yahoo movers held (fail backoff {wait}) — not spent")
+            return 0
+        # FinRobot #119: plan wall outlives backoff — weekend/cycle force
+        # must not thrash a billing entitlement (same as mid-backoff hold).
+        if yahoo_fail_plan_held(meta):
+            print("   📡 Yahoo movers held (plan) — not spent")
+            return 0
+        if not force and not self.yahoo_discovery_due(max_age_hours=max_age_hours):
+            print("   📡 Yahoo movers skipped (discovery fresh) — not spent")
+            return 0
+
+        screens_ok = 0
+        screens_failed = 0
+        timeout_fails = 0
+        inflight_fails = 0
+        claim_drops = 0
+        claim_dead = 0
+        claim_stale = 0
+        claim_live = 0
+        try:
+            report = discover_yahoo_mover_report(per_screen=per_screen)
+            symbols = report[0]
+            screens_ok = report[1]
+            screens_failed = report[2]
+            timeout_fails = report[3]
+            if len(report) > 4:
+                inflight_fails = report[4]
+            if len(report) > 5:
+                claim_drops = report[5]
+            if len(report) > 7:
+                claim_dead = report[6]
+                claim_stale = report[7]
+            if len(report) > 8:
+                claim_live = report[8]
+        except Exception as e:
+            print(f"   ⚠️ Yahoo movers discovery failed: {safe_exc_text(e)}")
+            meta["last_yahoo_discovery_status"] = "failed"
+            meta["last_yahoo_discovery_fail"] = yahoo_stamp_utc_iso()
+            meta["last_yahoo_screens_ok"] = 0
+            meta["last_yahoo_screens_failed"] = 0
+            meta["last_yahoo_prune_skipped"] = False
+            # Exception path never reached the pre-bundle sweep.
+            set_yahoo_discovery_claim_drops(meta, 0)
+            set_yahoo_discovery_claim_live(meta, 0, screens=())
+            # xang1234 #639: fail stamp alone hid repeated dead fetches;
+            # last-error class names why (inflight/timeout/http/empty/error).
+            set_yahoo_discovery_error(meta, classify_yahoo_discovery_error(e))
+            # Exception path has no per-screen mix — clear stale sides.
+            set_yahoo_discovery_error_sides(meta, timeout_fails=0, inflight_fails=0)
+            bump_yahoo_fail_streak(meta)
+            self.ensure_curated_seed()
+            self._save_universe()
+            return 0
+
+        meta["last_yahoo_screens_ok"] = int(screens_ok)
+        meta["last_yahoo_screens_failed"] = int(screens_failed)
+        # xang1234 #726: Ops console release visibility — speak zombie drops.
+        set_yahoo_discovery_claim_drops(
+            meta, claim_drops, dead=claim_dead, stale=claim_stale
+        )
+        # xang1234 stuck-asset honesty: hung screen still held after peers.
+        # Name which presets block catch-up (say what a stuck asset blocks).
+        live_screens = list_live_yahoo_screen_claims() if claim_live else []
+        if live_screens:
+            claim_live = len(live_screens)
+        set_yahoo_discovery_claim_live(
+            meta, claim_live, screens=live_screens
+        )
+        if screens_bundle_failed(screens_ok, screens_failed):
+            # xang1234: failed / majority-blocked fetch → reuse seed; do not
+            # stamp cache fresh; discard leftover quotes from a thin screen.
+            meta["last_yahoo_discovery_status"] = "failed"
+            meta["last_yahoo_discovery_fail"] = yahoo_stamp_utc_iso()
+            meta["last_yahoo_prune_skipped"] = False
+            set_yahoo_discovery_error(
+                meta,
+                classify_yahoo_discovery_error(
+                    screens_ok=screens_ok,
+                    screens_failed=screens_failed,
+                    timeout_fails=timeout_fails,
+                    inflight_fails=inflight_fails,
+                ),
+            )
+            # Winning class alone hid the other spend side (timeout↔held).
+            set_yahoo_discovery_error_sides(
+                meta,
+                timeout_fails=timeout_fails,
+                inflight_fails=inflight_fails,
+            )
+            bump_yahoo_fail_streak(meta)
+            self.ensure_curated_seed()
+            self._save_universe()
+            print(
+                "   ⚠️ Yahoo movers empty/blocked "
+                f"({screens_ok}/{screens_ok + screens_failed} screens) "
+                "— reuse curated seed; cache age kept"
+            )
+            return 0
+
+        added = 0
+        for sym in symbols:
+            if added >= max_new:
+                break
+            venue = listing_venue(sym)
+            exchange = "XETRA" if venue == "XETR" else "US"
+            if self.add_stock(sym, sector="yahoo_mover", exchange=exchange):
+                added += 1
+        # Complete snapshot only: empty/majority-fail returned above.
+        # xang1234 7e0df1e: a minority-failed bundle is still addable, but
+        # missing names are not a drop list — skip prune.
+        prune_skipped = screens_bundle_partial(screens_ok, screens_failed)
+        if prune_skipped:
+            dropped = 0
+        else:
+            dropped = self.prune_dropped_yahoo_movers(
+                symbols, venue=YAHOO_MOVER_SNAPSHOT_VENUE
+            )
+        meta["last_yahoo_discovery"] = yahoo_stamp_utc_iso()
+        meta["last_yahoo_discovery_status"] = "ok"
+        meta["last_yahoo_added"] = added
+        meta["last_yahoo_dropped"] = dropped
+        meta["last_yahoo_dropped_venue"] = YAHOO_MOVER_SNAPSHOT_VENUE
+        meta["last_yahoo_prune_skipped"] = prune_skipped
+        # xang1234 #639: only a success advances last-good; clear fail streak
+        # + last-error class (last_success honesty).
+        clear_yahoo_fail_streak(meta)
+        clear_yahoo_discovery_error(meta)
+        self._save_universe()
+        if prune_skipped:
+            print(
+                f"   📡 Yahoo movers → universe: +{added} "
+                f"(partial {screens_ok}/{screens_ok + screens_failed} · skip prune)"
+            )
+        elif added or dropped:
+            print(
+                f"   📡 Yahoo movers → universe: +{added} −{dropped} (cap {max_new})"
+            )
+        else:
+            print("   📡 Yahoo movers → universe: no new names")
+        return added
+
+    def _drop_stock(self, symbol: str) -> bool:
+        """Remove a symbol from stocks plus sector/exchange indexes."""
+        stocks = self.universe.get("stocks")
+        if not isinstance(stocks, dict) or symbol not in stocks:
+            return False
+        del stocks[symbol]
+        for idx in (self.universe.get("sectors"), self.universe.get("exchanges")):
+            if not isinstance(idx, dict):
+                continue
+            for key, syms in list(idx.items()):
+                if isinstance(syms, list) and symbol in syms:
+                    idx[key] = [s for s in syms if s != symbol]
+        return True
+
+    def prune_dropped_yahoo_movers(
+        self,
+        live_symbols: List[str],
+        *,
+        venue: str = YAHOO_MOVER_SNAPSHOT_VENUE,
+    ) -> int:
+        """Drop yahoo_mover names absent from a complete movers snapshot.
+
+        xang1234 weekly-US-stale-seed: deactivate symbols the source dropped.
+        Incomplete/empty/partly-failed fetches must not call this
+        (empty ≠ drop-all; a minority-failed bundle is not a drop list).
+        Curated seed names stay even if they were never movers.
+        Baseline is scoped to the snapshot venue (US Yahoo screens ≠ Xetra).
+        """
+        live = {str(s).strip().upper() for s in live_symbols if str(s).strip()}
+        want = str(venue or YAHOO_MOVER_SNAPSHOT_VENUE).strip().upper() or "US"
+        dropped = 0
+        stocks = self.universe.get("stocks")
+        if not isinstance(stocks, dict):
+            return 0
+        for symbol, info in list(stocks.items()):
+            if not isinstance(info, dict):
+                continue
+            if str(info.get("sector") or "") != "yahoo_mover":
+                continue
+            row_venue = listing_venue(symbol, str(info.get("exchange") or ""))
+            if row_venue != want:
+                continue
+            if str(symbol).strip().upper() in live:
+                continue
+            if self._drop_stock(symbol):
+                dropped += 1
+        return dropped
+
+    def add_stock(self, symbol: str, sector: str = "unknown", exchange: str = "unknown"):
+        """Add a stock to the universe."""
+        if symbol not in self.universe["stocks"]:
+            self.universe["stocks"][symbol] = {
+                "sector": sector,
+                "exchange": exchange,
+                "added": datetime.now().isoformat()
+            }
+
+            # Update sector index
+            if sector not in self.universe["sectors"]:
+                self.universe["sectors"][sector] = []
+            if symbol not in self.universe["sectors"][sector]:
+                self.universe["sectors"][sector].append(symbol)
+
+            # Update exchange index
+            if exchange not in self.universe["exchanges"]:
+                self.universe["exchanges"][exchange] = []
+            if symbol not in self.universe["exchanges"][exchange]:
+                self.universe["exchanges"][exchange].append(symbol)
+
+            return True
+        return False
+
+    def add_stocks_batch(self, stocks: List[Dict]):
+        """Add multiple stocks at once."""
+        added = 0
+        for stock in stocks:
+            if self.add_stock(stock.get("symbol"), stock.get("sector", "unknown"), stock.get("exchange", "unknown")):
+                added += 1
+
+        if added > 0:
+            self._save_universe()
+            print(f"✅ Added {added} new stocks to universe")
+
+        return added
+
+    def get_stocks_to_scan(
+        self,
+        limit: int = DEFAULT_SCAN_BATCH_LIMIT,
+        max_age_hours: int = DEFAULT_SCAN_MAX_AGE_HOURS,
+    ) -> tuple:
+        """
+        Get next batch of stocks to scan based on scan history.
+        
+        Returns:
+            Tuple of (list of symbols to scan, was_cycle_reset)
+            was_cycle_reset: True if a full cycle was just completed and reset
+        """
+        # Yahoo screen knobs already refused bool; scan batch/age were still
+        # open to int(True)→1 name / 1h re-scan invent.
+        limit = _coerce_scan_batch_limit(limit)
+        max_age_hours = _coerce_scan_max_age_hours(max_age_hours)
+        cutoff_time = (datetime.now() - timedelta(hours=max_age_hours)).isoformat()
+
+        # Get all stocks
+        all_stocks = list(self.universe["stocks"].keys())
+
+        # Filter out recently scanned stocks
+        unscanned = []
+        stale = []
+
+        for symbol in all_stocks:
+            last_scan = self.scan_history["scanned"].get(symbol)
+
+            if not last_scan:
+                unscanned.append(symbol)
+            elif last_scan < cutoff_time:
+                stale.append(symbol)
+
+        # Prioritize: unscanned first, then stale
+        candidates = unscanned + stale
+
+        # If we've scanned everything recently, reset and start over
+        was_reset = False
+        if len(candidates) < limit:
+            print(f"🔄 Completed full market cycle! Scanned {len(self.universe['stocks'])} stocks")
+            self.scan_history["last_full_cycle"] = datetime.now().isoformat()
+            self.scan_history["scanned"] = {}
+            self._save_scan_history()
+            candidates = all_stocks
+            was_reset = True
+
+        # Return next batch
+        import random
+        random.shuffle(candidates)  # Randomize to avoid patterns
+        return candidates[:limit], was_reset
+
+    def mark_scanned(self, symbols: List[str]):
+        """Mark stocks as scanned."""
+        now = datetime.now().isoformat()
+        for symbol in symbols:
+            self.scan_history["scanned"][symbol] = now
+
+        self._save_scan_history()
+
+    def get_stats(self) -> Dict:
+        """Get universe statistics."""
+        # Reload scan history from disk to ensure we have latest data
+        self.scan_history = self._load_scan_history()
+        
+        total = len(self.universe["stocks"])
+        scanned = len(self.scan_history["scanned"])
+
+        return {
+            "total_stocks": total,
+            "scanned_stocks": scanned,
+            "unscanned_stocks": total - scanned,
+            "coverage_pct": (scanned / total * 100) if total > 0 else 0,
+            "sectors": len(self.universe["sectors"]),
+            "exchanges": len(self.universe["exchanges"]),
+            "last_updated": self.universe.get("last_updated"),
+            "last_full_cycle": self.scan_history.get("last_full_cycle")
+        }
+
+    def discover_and_add_stocks(
+        self, *, force_yahoo: bool = False, yahoo_max_age_hours: int | None = None
+    ) -> int:
+        """Merge curated seed + Yahoo movers into the universe (discovery only)."""
+        from stock_checker.yahoo_universe_discovery import (
+            DEFAULT_YAHOO_DISCOVERY_MAX_AGE_HOURS,
+            _coerce_yahoo_max_age_hours,
+        )
+
+        # Pre-int(True)→1 bypassed due refuse — coerce at the boundary.
+        age_h = (
+            DEFAULT_YAHOO_DISCOVERY_MAX_AGE_HOURS
+            if yahoo_max_age_hours is None
+            else _coerce_yahoo_max_age_hours(yahoo_max_age_hours)
+        )
+        added = self.ensure_curated_seed()
+        try:
+            added += self.discover_yahoo_movers(
+                force=force_yahoo, max_age_hours=age_h
+            )
+        except Exception as e:
+            print(f"⚠️  Yahoo discovery skipped: {safe_exc_text(e, limit=100)}")
+        return added

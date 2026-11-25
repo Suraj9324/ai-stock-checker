@@ -1,0 +1,36 @@
+---
+description: AI Stock Checker product rules for agents
+alwaysApply: true
+---
+
+# AI Stock Checker — Agent Rule
+
+## Goal
+Best local Docker stock/crypto checker + paper trader for a small friend group: low churn, honest docs, validated strategies.
+
+## Must follow
+- Secrets only via `.env` (see `.env.example`). Never hardcode API keys.
+- Primary service: `intelligent-trader` in `docker-compose.yml`.
+- Anti-churn defaults: min hold ≥4h, scan ≥15m, trade ≥5m.
+- Paper fees: Revolut-like default (0.25%/side · €1 min); configurable on Ops.
+- Filter stables/leveraged/noise via `stock_checker/symbol_filters.py`.
+- Live crypto buys: BTC/ETH only, max 1 crypto slot, ±10% exits (`stock_checker/crypto_policy.py`); live scan is majors-only too.
+- Equity universe: curated US + German Xetra (`.DE`) + a short ETF / metal ETC list (`listed_funds.py`); per-symbol session hours (`market_hours.py`).
+- Prefer Chrome MCP for live `pro.openbb.co` research (see `OPENBB.md`); do not invent OpenBB data.
+- Desk UI: follow `DESIGN.md` + `.cursor/skills/paper-desk-design/` (anti AI-slop).
+- AI: instruct models only (`gemma4:latest`, `qwen3.5:9b`) — not coder models.
+- No unverified performance claims in docs.
+- Prefer Docker for deps; do not install on host.
+- Keep `README.md` and `AGENTS.md` aligned with code.
+- Senior simplify: prefer remove/merge over add — `.cursor/rules/senior-simplify.mdc`.
+- Full autopilot: follow `AUTOPILOT.md`. Work `IMPROVEMENT.md` top-down without waiting for the human to ask. On `AGENT_LOOP_TICK_improve`, implement, verify, **commit, push, restart services/loops as needed**. Overnight CEST is expected — keep working while the human sleeps.
+
+## Git (commit + push after EVERY change)
+- Follow `GIT.md` and `.cursor/rules/commit-push-always.mdc`.
+- After each verified coherent change: **commit + push** (`git push -u origin HEAD`).
+- Do **not** wait for the human to say “commit” or “push”. Leaving verified work uncommitted is a bug.
+- Never commit secrets/`data/`; never force-push `main`.
+- Never add Cursor/agent commit trailers (`Co-authored-by: Cursor`, etc.). Use `./scripts/install-git-hooks.sh`.
+
+## Verify
+`docker build -t ai-stock-checker . && docker run --rm ai-stock-checker pytest -q`

@@ -1,0 +1,142 @@
+# AI Stock Checker — for friends
+
+Short path to share signals and paper-trade together.
+
+Repo: https://github.com/raro42/ai-stock-checker
+
+**Shared paper desk (no install):** [https://stock.zeitfenster.de/desk](https://stock.zeitfenster.de/desk)
+
+### No login — what’s “named desk unset”?
+
+There is **no account login** on the shared desk. Anyone with the URL can read marks.
+Optional friend books use the header switcher / `?account=anna` (Mode A) — not a password.
+Default with no query is the **legacy root** book (`data/portfolio.json`) — that is normal and fine.
+
+Header `named desk unset · open is legacy` means only the optional signed `accounts/desk/`
+ledger has not been reset yet. It is **not** an error and **not** a login prompt. Ops can
+create it with `python3 scripts/reset_paper_portfolio.py --account desk --capital 100000`
+when the group wants that race id ([docs/MULTI_ACCOUNT.md](docs/MULTI_ACCOUNT.md)).
+
+Self-host below if you want your own book on your machine.
+
+## 1. Install
+
+- Docker Desktop
+- Optional LLM: [Ollama](https://ollama.com) with `gemma4:latest` (house instruct default) **or** a free Groq/OpenRouter key ([MODELS.md](MODELS.md))
+- Optional: free [Finnhub](https://finnhub.io) API key
+
+## 2. Configure
+
+```bash
+git clone https://github.com/raro42/ai-stock-checker.git
+cd ai-stock-checker
+cp .env.example .env
+# Defaults: AI_MODE=off (no LLM needed). Paper desk still works.
+# Optional: FINNHUB_API_KEY=...
+# Optional cloud AI (no local Ollama):
+#   AI_MODE=validate
+#   LLM_BACKEND=openai
+#   OPENAI_API_KEY=...
+#   OPENAI_BASE_URL=https://api.groq.com/openai/v1
+#   AI_MODEL=llama-3.1-8b-instant
+```
+
+## 3. Run paper trader (+ OpenBB widgets)
+
+```bash
+docker compose up -d --build intelligent-trader openbb-backend
+docker compose logs -f --tail 50 intelligent-trader openbb-backend
+```
+
+Defaults avoid fee-burn: 15m scans, 5m checks, **24h minimum hold** (Ops/compose; floor still ≥4h).
+Paper fees default to **Revolut-like 0.25%/side · €1 min** (change on Ops).
+
+Paper desk UI: shared [https://stock.zeitfenster.de/desk](https://stock.zeitfenster.de/desk) · local [http://127.0.0.1:7779/desk](http://127.0.0.1:7779/desk) (Overview / Charts / Screener / Breadth / Book / Ideas / Ops) · Design: [DESIGN.md](DESIGN.md) · OpenBB widgets: same host — see [OPENBB.md](OPENBB.md).
+
+## 4. Useful commands
+
+```bash
+# Portfolio / fee summary (host)
+python3 scripts/summarize_trades.py --trades data/trades.jsonl
+
+# Fresh start (€10k) — use when startup warns about fee burn
+python3 scripts/reset_paper_portfolio.py --capital 10000
+
+# Strategy vs buy-and-hold (offline; do not trust until it beats SPY)
+./scripts/run_benchmark_buy_hold.sh
+
+# One-off check
+docker run --rm --network host ai-stock-checker python3 -m stock_checker.cli info AAPL
+
+# Backtest
+docker run --rm --network host ai-stock-checker \
+  python3 -m stock_checker.cli backtest AAPL -p 1y
+
+# Docs / health hygiene
+./scripts/healthcheck.sh
+./scripts/docs_weekly_check.sh
+```
+
+## If the trader warns about fees
+
+On startup you may see `High fee burn: …`. That means the old paper book churned too hard.
+
+1. Stop: `docker compose stop intelligent-trader`
+2. Reset: `python3 scripts/reset_paper_portfolio.py --capital 10000`
+3. Start again: `docker compose up -d intelligent-trader`
+4. Keep the **24h min hold** — do not “fix” fees by trading faster.
+
+## LAYA / JEV — are we using it?
+
+**Not on the shared desk by default.** The stack can call an optional LAYA/JEV System-1
+advisory (typed `pass` / `hold` / `reject`) when someone sets `LAYA_BASE_URL` +
+`LAYA_ADVISORY=1` in `.env` and runs a remote/local endpoint. It is **fail-open** and
+**not a buy gate** — paper entries still follow rules + soft gates + exits.
+
+To try it on your own host: [docs/LAYA.md](docs/LAYA.md). Live veto stays deferred until
+promote A/B honesty + a calm paper sample.
+
+## Competing paper books (Mode A)
+
+Friends can keep separate paper ledgers and a leaderboard ([GitHub #4](https://github.com/raro42/ai-stock-checker/issues/4) · [docs/MULTI_ACCOUNT.md](docs/MULTI_ACCOUNT.md)).
+
+```bash
+python3 scripts/reset_paper_portfolio.py --account anna --capital 100000
+# Shared named desk (signoff) — create when ops wants the race id:
+python3 scripts/reset_paper_portfolio.py --account desk --capital 100000
+python3 scripts/paper_leaderboard.py
+```
+
+Desk: `?account=anna` (or `desk`) · Overview shows the board. Header speaks `named desk unset` (and `· open is legacy|<id>` on desk pages) until `accounts/desk/` has a portfolio — not a login error; when desk is ready but you are on legacy/`anna`, it speaks `desk ready · viewing legacy|anna` so the pin does not imply the open book is the signed desk; if the open named **or legacy** book itself is missing/damaged, the pin adds `· missing` / `· damaged` (and warns) so `viewing anna` / `viewing legacy` is not a calm ready-looking open ledger; if signed desk warns but the open book is usable, it adds `· ok` so unset/damaged does not look like the open book is broken too; when that open-ledger bit spoke, it also speaks `desk vs open clash|align` so pin↔open agreement is not hidden. Scan archives stay shared; only portfolio/trades are per account. Default with no query is still the legacy `data/portfolio.json` book. Autopaper Mode B (one trader per account) is optional later.
+
+## Rules of the group
+
+1. Paper trade only until a strategy survives **walk-forward vs SPY under live-shaped fees** **and** a calm paper month.
+2. Do not paste API keys in chat — use `.env`.
+3. Prefer boring holdings over meme churn (current fresh book: **WMT** + cash).
+4. If fees > realized edge, slow down or reset:
+
+```bash
+KEEP_SYMBOLS=WMT RESET_CAPITAL=100000 ./scripts/fresh_start_keep.sh
+```
+
+5. Health anytime: `./scripts/healthcheck.sh`
+
+## Funds and metals
+
+The scan also checks a short list. It does not scan the whole ETF market.
+
+| Symbol | What it is |
+|--------|------------|
+| `VWCE.DE` | World stock ETF |
+| `SXR8.DE` | S&P 500 ETF, euro |
+| `SPY` | S&P 500 ETF, US |
+| `4GLD.DE` | Xetra-Gold (ETC, one gram of gold) |
+| `XAD6.DE` | Physical silver ETC |
+| `GLD`, `SLV` | US gold and silver funds |
+
+`SXR8.DE` and `SPY` are the same index. A single metal in the EU is an ETC, not a UCITS ETF. The same hold time and fees apply. `GLD` and `SLV` are funds, not bars in a vault. More detail: [docs/history/metals_invest_2026-09-20.md](docs/history/metals_invest_2026-09-20.md).
+
+History summaries land in `docs/history/` (committed). Full JSONL backups stay in `data/backup_*`.
+
+As of **2026-07-30**: offline walk-forward **beats SPY** under Revolut-standard fees. Promote filter + anti flip-flop + **overweight exits-only** are live. Prefer AI **validate** over **full** while the book is healing. That is **not** live proof — wait a calm month before treating promote as the group default.

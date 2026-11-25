@@ -1,0 +1,1343 @@
+"""Improve-tick freshness glance (hourly Cursor keep-alive; display only)."""
+
+from __future__ import annotations
+
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+from openbb_backend.charts import load_chart_payload
+from openbb_backend.desk import (
+    DEFAULT_IMPROVE_TICK_TAIL_LINES,
+    IMPROVE_TICK_AGING_SEC,
+    IMPROVE_TICK_FRESH_SEC,
+    _IMPROVE_TICK_LEAN_NAME_CAP,
+    _coerce_improve_tick_band_sec,
+    _coerce_improve_tick_lean_name_cap,
+    _coerce_improve_tick_tail_lines,
+    _resolve_improve_tick_bands,
+    _tail_improve_log_lines,
+    build_improve_tick_glance,
+    improve_tick_fresher_polarity_vs_scan_meter_bits,
+    improve_tick_fresher_vs_source_bits,
+    improve_tick_fresher_vs_status_age_bits,
+    improve_tick_fresher_vs_stuck_bits,
+    improve_tick_lean_meta,
+    improve_tick_lean_open,
+    improve_tick_source_speak,
+    improve_tick_source_vs_scan_bits,
+    improve_tick_status_age_vs_scan_bits,
+    improve_tick_status_vs_age_bits,
+    improve_tick_stuck_band_bits,
+    improve_tick_stuck_bits,
+    improve_tick_stuck_peers_bits,
+    improve_tick_stuck_peers_vs_fpm_bits,
+    improve_tick_stuck_vs_scan_bits,
+    improve_tick_vs_scan_fresher_bits,
+    improve_tick_vs_scan_fresher_gap_sides_bits,
+    load_desk_snapshot,
+)
+
+
+def _clock(iso: str) -> datetime:
+    return datetime.strptime(iso, "%Y-%m-%dT%H:%MZ").replace(tzinfo=timezone.utc)
+
+
+def test_improve_tick_glance_empty(tmp_path: Path) -> None:
+    assert build_improve_tick_glance(None)["ready"] is False
+    assert build_improve_tick_glance(tmp_path)["ready"] is False
+
+
+def test_improve_tick_tail_lines_refuses_bool(tmp_path: Path) -> None:
+    # tradermonty #700/#655 + xang1234: True→1 / lines[-True] must not invent
+    # a one-line Ops improve clock (parity with desk_logs tail bytes).
+    assert _coerce_improve_tick_tail_lines(True) == DEFAULT_IMPROVE_TICK_TAIL_LINES
+    assert _coerce_improve_tick_tail_lines(False) == DEFAULT_IMPROVE_TICK_TAIL_LINES
+    assert _coerce_improve_tick_tail_lines(0) == DEFAULT_IMPROVE_TICK_TAIL_LINES
+    assert _coerce_improve_tick_tail_lines(None) == DEFAULT_IMPROVE_TICK_TAIL_LINES
+    assert _coerce_improve_tick_tail_lines(12) == 12
+
+    log = tmp_path / "run_cursor_improve.log"
+    body = "\n".join(
+        f"2026-11-09T20:{i:02d}Z cursor improve end rc=0" for i in range(10)
+    )
+    log.write_text(body + "\n", encoding="utf-8")
+    # Damaged bool ceiling falls back to default (≥10) — keeps the full strip.
+    assert len(_tail_improve_log_lines(log, max_lines=True)) == 10
+    assert len(_tail_improve_log_lines(log, max_lines=False)) == 10
+    # Real small ceiling still truncates.
+    assert len(_tail_improve_log_lines(log, max_lines=3)) == 3
+    assert _tail_improve_log_lines(log, max_lines=3)[-1].endswith("rc=0")
+
+
+def test_improve_tick_band_sec_refuses_bool(tmp_path: Path) -> None:
+    # tradermonty #700/#655 + RyanJHamby/xang1234: True→1s must not invent a
+    # near-immediate aging/stale Ops improve band (parity with scan interval).
+    assert _coerce_improve_tick_band_sec(True, IMPROVE_TICK_FRESH_SEC) == (
+        IMPROVE_TICK_FRESH_SEC
+    )
+    assert _coerce_improve_tick_band_sec(False, IMPROVE_TICK_AGING_SEC) == (
+        IMPROVE_TICK_AGING_SEC
+    )
+    assert _coerce_improve_tick_band_sec(0, IMPROVE_TICK_FRESH_SEC) == (
+        IMPROVE_TICK_FRESH_SEC
+    )
+    assert _coerce_improve_tick_band_sec(None, IMPROVE_TICK_FRESH_SEC) == (
+        IMPROVE_TICK_FRESH_SEC
+    )
+    assert _coerce_improve_tick_band_sec(120, IMPROVE_TICK_FRESH_SEC) == 120
+    # Inverted / equal pair falls back to module defaults.
+    assert _resolve_improve_tick_bands(3600, 60) == (
+        IMPROVE_TICK_FRESH_SEC,
+        IMPROVE_TICK_AGING_SEC,
+    )
+    assert _resolve_improve_tick_bands(True, True) == (
+        IMPROVE_TICK_FRESH_SEC,
+        IMPROVE_TICK_AGING_SEC,
+    )
+
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T20:40Z cursor improve start\n"
+        "2026-11-09T20:46Z cursor improve end rc=0\n",
+        encoding="utf-8",
+    )
+    # 14m age: bool floors must keep default 75m fresh band (not True→1s aging).
+    g_bool = build_improve_tick_glance(
+        tmp_path,
+        now=_clock("2026-11-09T21:00Z"),
+        fresh_sec=True,
+        aging_sec=True,
+    )
+    assert g_bool["freshness"] == "fresh"
+    assert g_bool["tone"] == "ok"
+    # Real tiny floors still classify honestly.
+    g_tight = build_improve_tick_glance(
+        tmp_path,
+        now=_clock("2026-11-09T21:00Z"),
+        fresh_sec=60,
+        aging_sec=120,
+    )
+    assert g_tight["freshness"] == "stale"
+    assert g_tight["tone"] == "warn"
+
+
+def test_improve_tick_glance_fresh_ok(tmp_path: Path) -> None:
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T20:40Z cursor improve start\n"
+        "2026-11-09T20:46Z cursor improve end rc=0\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T21:00Z")
+    )
+    assert g["ready"] is True
+    assert g["tone"] == "ok"
+    assert g["freshness"] == "fresh"
+    assert g["failed"] is False
+    assert g["rc"] == 0
+    assert g["source"] == "cursor end"
+    assert g["source_bit"] == ""
+    assert g["source_escalate"] is False
+    assert "fresh" in g["line"]
+    assert "ok" in g["line"]
+    assert "start only" not in g["line"]
+    assert "log mtime" not in g["line"]
+    assert g["age_sec"] == 14 * 60
+
+
+def test_improve_tick_source_speak() -> None:
+    assert improve_tick_source_speak("") == ("", False)
+    assert improve_tick_source_speak("cursor end") == ("", False)
+    assert improve_tick_source_speak("cursor start") == ("start only", True)
+    assert improve_tick_source_speak("loop tick") == ("loop tick", False)
+    assert improve_tick_source_speak("cursor log") == ("log mtime", True)
+    assert improve_tick_source_speak("loop log") == ("log mtime", True)
+
+
+def test_improve_tick_stuck_bits() -> None:
+    # Fresh escalate = still running — not stuck.
+    assert improve_tick_stuck_bits(
+        "start only", "fresh", source_escalate=True
+    ) == ("", False)
+    # Aging/stale escalate = hung activity (xang1234 fundamentals-stuck).
+    assert improve_tick_stuck_bits(
+        "start only", "aging", source_escalate=True
+    ) == ("stuck", True)
+    assert improve_tick_stuck_bits(
+        "log mtime", "stale", source_escalate=True
+    ) == ("stuck", True)
+    # Leftover wake heartbeat / finished end never mark stuck.
+    assert improve_tick_stuck_bits(
+        "loop tick", "stale", source_escalate=False
+    ) == ("", False)
+    assert improve_tick_stuck_bits("", "stale", source_escalate=False) == (
+        "",
+        False,
+    )
+
+
+def test_improve_tick_stuck_vs_scan_bits() -> None:
+    assert improve_tick_stuck_vs_scan_bits("", "clash · scan fresh") == (
+        "",
+        False,
+    )
+    assert improve_tick_stuck_vs_scan_bits("stuck", "") == ("", False)
+    # Both adverse → confirm (hung clock + scan clash agree desk is not live).
+    assert improve_tick_stuck_vs_scan_bits(
+        "stuck", "clash · scan fresh"
+    ) == ("stuck vs scan align · clash", False)
+    assert improve_tick_stuck_vs_scan_bits(
+        "stuck", "clash · scan stale"
+    ) == ("stuck vs scan align · clash", False)
+
+
+def test_improve_tick_stuck_band_bits() -> None:
+    assert improve_tick_stuck_band_bits("", "aging") == ("", False)
+    assert improve_tick_stuck_band_bits("stuck", "fresh") == ("", False)
+    assert improve_tick_stuck_band_bits("stuck", "aging") == (
+        "stuck band · aging",
+        False,
+    )
+    assert improve_tick_stuck_band_bits("stuck", "stale") == (
+        "stuck band · stale",
+        False,
+    )
+
+
+def test_improve_tick_status_vs_age_bits() -> None:
+    assert improve_tick_status_vs_age_bits(
+        failed=False, rc=None, freshness="stale"
+    ) == ("", False)
+    assert improve_tick_status_vs_age_bits(
+        failed=False, rc=0, freshness="fresh"
+    ) == ("", False)
+    assert improve_tick_status_vs_age_bits(
+        failed=False, rc=0, freshness="aging"
+    ) == ("", False)
+    assert improve_tick_status_vs_age_bits(
+        failed=False, rc=0, freshness="stale"
+    ) == ("status/age clash · ok · stale", True)
+    assert improve_tick_status_vs_age_bits(
+        failed=True, rc=1, freshness="fresh"
+    ) == ("status/age clash · fail · fresh", True)
+    assert improve_tick_status_vs_age_bits(
+        failed=True, rc=1, freshness="stale"
+    ) == ("status/age align · fail · stale", False)
+
+
+def test_improve_tick_status_age_vs_scan_bits() -> None:
+    assert improve_tick_status_age_vs_scan_bits("", "clash · scan stale") == (
+        "",
+        False,
+    )
+    assert improve_tick_status_age_vs_scan_bits(
+        "status/age clash · ok · stale", ""
+    ) == ("", False)
+    assert improve_tick_status_age_vs_scan_bits(
+        "status/age clash · ok · stale", "clash · scan fresh"
+    ) == ("status/age vs scan align · clash", False)
+    assert improve_tick_status_age_vs_scan_bits(
+        "status/age clash · fail · fresh", "clash · scan stale"
+    ) == ("status/age vs scan align · clash", False)
+    assert improve_tick_status_age_vs_scan_bits(
+        "status/age align · fail · stale", "clash · scan fresh"
+    ) == ("clash · status/age align · scan fresh", True)
+
+
+def test_improve_tick_source_vs_scan_bits() -> None:
+    assert improve_tick_source_vs_scan_bits("", "clash · scan stale") == (
+        "",
+        False,
+    )
+    assert improve_tick_source_vs_scan_bits(
+        "start only", "", source_escalate=True
+    ) == ("", False)
+    assert improve_tick_source_vs_scan_bits(
+        "start only", "clash · scan stale", source_escalate=True
+    ) == ("source vs scan align · clash", False)
+    assert improve_tick_source_vs_scan_bits(
+        "log mtime", "clash · scan fresh", source_escalate=True
+    ) == ("source vs scan align · clash", False)
+    assert improve_tick_source_vs_scan_bits(
+        "loop tick", "clash · scan stale", source_escalate=False
+    ) == ("clash · source loop tick · scan stale", True)
+
+
+def test_improve_tick_vs_scan_fresher_bits() -> None:
+    assert improve_tick_vs_scan_fresher_bits("fresh", "stale", "") == (
+        "",
+        False,
+    )
+    assert improve_tick_vs_scan_fresher_bits(
+        "fresh", "fresh", "clash · scan fresh"
+    ) == ("", False)
+    assert improve_tick_vs_scan_fresher_bits(
+        "fresh", "stale", "clash · scan stale"
+    ) == ("fresher improve · gap wide", False)
+    assert improve_tick_vs_scan_fresher_bits(
+        "fresh", "aging", "clash · scan aging"
+    ) == ("fresher improve · gap thin", False)
+    assert improve_tick_vs_scan_fresher_bits(
+        "stale", "fresh", "clash · scan fresh"
+    ) == ("fresher scan · gap wide", True)
+    assert improve_tick_vs_scan_fresher_bits(
+        "aging", "fresh", "clash · scan fresh"
+    ) == ("fresher scan · gap thin", True)
+
+
+def test_improve_tick_vs_scan_fresher_gap_sides_bits() -> None:
+    assert improve_tick_vs_scan_fresher_gap_sides_bits(
+        "fresh", "stale", ""
+    ) == ("", False)
+    assert improve_tick_vs_scan_fresher_gap_sides_bits(
+        "fresh", "unknown", "fresher improve · gap wide"
+    ) == ("", False)
+    assert improve_tick_vs_scan_fresher_gap_sides_bits(
+        "fresh", "stale", "fresher improve · gap wide"
+    ) == ("gap sides · improve fresh · scan stale", False)
+    assert improve_tick_vs_scan_fresher_gap_sides_bits(
+        "aging", "fresh", "fresher scan · gap thin"
+    ) == ("gap sides · improve aging · scan fresh", False)
+
+
+def test_improve_tick_fresher_vs_status_age_bits() -> None:
+    assert improve_tick_fresher_vs_status_age_bits(
+        "", "status/age clash · ok · stale"
+    ) == ("", False)
+    assert improve_tick_fresher_vs_status_age_bits(
+        "fresher scan · gap wide", ""
+    ) == ("", False)
+    assert improve_tick_fresher_vs_status_age_bits(
+        "fresher scan · gap wide", "status/age clash · ok · stale"
+    ) == ("fresher vs status/age align", False)
+    assert improve_tick_fresher_vs_status_age_bits(
+        "fresher scan · gap wide", "status/age align · fail · stale"
+    ) == ("fresher vs status/age align", False)
+    assert improve_tick_fresher_vs_status_age_bits(
+        "fresher improve · gap thin", "status/age clash · fail · fresh"
+    ) == ("fresher vs status/age align", False)
+    assert improve_tick_fresher_vs_status_age_bits(
+        "fresher improve · gap wide", "status/age clash · ok · stale"
+    ) == ("fresher vs status/age clash · fresher improve · stale", True)
+    assert improve_tick_fresher_vs_status_age_bits(
+        "fresher scan · gap thin", "status/age clash · fail · fresh"
+    ) == ("fresher vs status/age clash · fresher scan · fresh", True)
+
+
+def test_improve_tick_fresher_vs_source_bits() -> None:
+    assert improve_tick_fresher_vs_source_bits(
+        "", "start only", source_escalate=True
+    ) == ("", False)
+    assert improve_tick_fresher_vs_source_bits(
+        "fresher improve · gap wide", "", source_escalate=True
+    ) == ("", False)
+    assert improve_tick_fresher_vs_source_bits(
+        "fresher improve · gap wide",
+        "loop tick",
+        source_escalate=False,
+    ) == ("", False)
+    assert improve_tick_fresher_vs_source_bits(
+        "fresher scan · gap wide",
+        "start only",
+        source_escalate=True,
+    ) == ("fresher vs source align", False)
+    assert improve_tick_fresher_vs_source_bits(
+        "fresher scan · gap thin",
+        "log mtime",
+        source_escalate=True,
+    ) == ("fresher vs source align", False)
+    assert improve_tick_fresher_vs_source_bits(
+        "fresher improve · gap wide",
+        "start only",
+        source_escalate=True,
+    ) == ("fresher vs source clash · fresher improve · start only", True)
+    assert improve_tick_fresher_vs_source_bits(
+        "fresher improve · gap thin",
+        "log mtime",
+        source_escalate=True,
+    ) == ("fresher vs source clash · fresher improve · log mtime", True)
+
+
+def test_improve_tick_fresher_vs_stuck_bits() -> None:
+    assert improve_tick_fresher_vs_stuck_bits("", "stuck") == ("", False)
+    assert improve_tick_fresher_vs_stuck_bits(
+        "fresher scan · gap thin", ""
+    ) == ("", False)
+    assert improve_tick_fresher_vs_stuck_bits(
+        "fresher scan · gap thin", "stuck"
+    ) == ("fresher vs stuck align", False)
+    assert improve_tick_fresher_vs_stuck_bits(
+        "fresher scan · gap wide", "stuck"
+    ) == ("fresher vs stuck align", False)
+    assert improve_tick_fresher_vs_stuck_bits(
+        "fresher improve · gap thin", "stuck"
+    ) == ("fresher vs stuck clash · fresher improve · stuck", True)
+    assert improve_tick_fresher_vs_stuck_bits(
+        "fresher improve · gap wide", "stuck"
+    ) == ("fresher vs stuck clash · fresher improve · stuck", True)
+
+
+def test_improve_tick_stuck_peers_bits() -> None:
+    assert improve_tick_stuck_peers_bits("", "fresher vs stuck align") == (
+        "",
+        False,
+    )
+    assert improve_tick_stuck_peers_bits(
+        "stuck vs scan align · clash", ""
+    ) == ("", False)
+    assert improve_tick_stuck_peers_bits(
+        "stuck vs scan align · clash",
+        "fresher vs stuck align",
+    ) == ("stuck peers align · both align", False)
+    assert improve_tick_stuck_peers_bits(
+        "stuck vs scan align · clash",
+        "fresher vs stuck clash · fresher improve · stuck",
+    ) == (
+        "clash · stuck peers · stuck-scan align · fresher↔stuck clash",
+        True,
+    )
+    assert improve_tick_stuck_peers_bits(
+        "clash · stuck vs scan · scan fresh",
+        "fresher vs stuck clash · fresher improve · stuck",
+    ) == ("stuck peers align · both clash", True)
+    assert improve_tick_stuck_peers_bits(
+        "clash · stuck vs scan · scan fresh",
+        "fresher vs stuck align",
+    ) == (
+        "clash · stuck peers · stuck-scan clash · fresher↔stuck align",
+        True,
+    )
+    assert (
+        improve_tick_lean_meta("stuck peers align · both align")
+        == "confirm · not thin · stuck peers"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "clash · stuck peers · stuck-scan align · fresher↔stuck clash",
+            warn=True,
+            stuck=True,
+        )
+        == "warn · hung · not thin · stuck peers"
+    )
+
+
+def test_improve_tick_stuck_peers_vs_fpm_bits() -> None:
+    assert improve_tick_stuck_peers_vs_fpm_bits(
+        "", "fresher polarity vs scan-meter align"
+    ) == ("", False)
+    assert improve_tick_stuck_peers_vs_fpm_bits(
+        "stuck peers align · both align", ""
+    ) == ("", False)
+    assert improve_tick_stuck_peers_vs_fpm_bits(
+        "stuck peers align · both align",
+        "fresher polarity vs scan-meter align",
+    ) == ("peers↔ vs fpm align · both align", False)
+    assert improve_tick_stuck_peers_vs_fpm_bits(
+        "stuck peers align · both clash",
+        "clash · fresher polarity clash · scan-meter align",
+    ) == ("peers↔ vs fpm align · both clash", True)
+    # Dual-adverse confirm (align · clash) is not warn — outer bridge stays calm.
+    assert improve_tick_stuck_peers_vs_fpm_bits(
+        "stuck peers align · both align",
+        "fresher polarity vs scan-meter align · clash",
+    ) == ("peers↔ vs fpm align · both align", False)
+    assert improve_tick_stuck_peers_vs_fpm_bits(
+        "clash · stuck peers · stuck-scan align · fresher↔stuck clash",
+        "fresher polarity vs scan-meter align",
+    ) == ("clash · peers↔ vs fpm · peers clash · fpm align", True)
+    assert improve_tick_stuck_peers_vs_fpm_bits(
+        "stuck peers align · both align",
+        "clash · scan-meter · fresher polarity align",
+    ) == ("clash · peers↔ vs fpm · peers align · fpm clash", True)
+    assert (
+        improve_tick_lean_meta("peers↔ vs fpm align · both align")
+        == "confirm · not thin · peers↔ vs fpm"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "clash · peers↔ vs fpm · peers clash · fpm align",
+            warn=True,
+            stuck=True,
+        )
+        == "warn · hung · not thin · peers↔ vs fpm"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "stuck peers align · both align · "
+            "fresher polarity vs scan-meter align · "
+            "peers↔ vs fpm align · both align"
+        )
+        == "confirm · not thin · peers↔ vs fpm · stuck peers · "
+        "fresher polarity vs scan-meter"
+    )
+
+
+def test_improve_tick_fresher_polarity_vs_scan_meter_bits() -> None:
+    assert improve_tick_fresher_polarity_vs_scan_meter_bits("", "fresher vs source align") == (
+        "",
+        False,
+    )
+    assert improve_tick_fresher_polarity_vs_scan_meter_bits(
+        "source vs scan align · clash", ""
+    ) == ("", False)
+    assert improve_tick_fresher_polarity_vs_scan_meter_bits(
+        "source vs scan align · clash",
+        "fresher vs source align",
+    ) == ("fresher polarity vs scan-meter align", False)
+    assert improve_tick_fresher_polarity_vs_scan_meter_bits(
+        "status/age vs scan align · clash",
+        "fresher vs status/age align",
+    ) == ("fresher polarity vs scan-meter align", False)
+    assert improve_tick_fresher_polarity_vs_scan_meter_bits(
+        "clash · source loop tick · scan stale",
+        "fresher vs source clash · fresher improve · start only",
+    ) == ("fresher polarity vs scan-meter align · clash", False)
+    assert improve_tick_fresher_polarity_vs_scan_meter_bits(
+        "source vs scan align · clash",
+        "fresher vs source clash · fresher improve · start only",
+    ) == ("clash · fresher polarity clash · scan-meter align", True)
+    assert improve_tick_fresher_polarity_vs_scan_meter_bits(
+        "clash · status/age align · scan fresh",
+        "fresher vs status/age align",
+    ) == ("clash · scan-meter · fresher polarity align", True)
+
+
+def test_improve_tick_lean_meta() -> None:
+    assert improve_tick_lean_meta("") == "quiet"
+    # Finished calm with spoken meter stages speaks confirm · not thin
+    # (peer of warn · not thin; hung already had confirm · hung · not thin).
+    assert (
+        improve_tick_lean_meta("status/age vs scan align · clash")
+        == "confirm · not thin · status/age vs scan"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "clash · status/age align · scan fresh", warn=True
+        )
+        == "warn · not thin · status/age vs scan"
+    )
+    assert (
+        improve_tick_lean_meta("source vs scan align · clash")
+        == "confirm · not thin · source vs scan"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "clash · source loop tick · scan stale", warn=True
+        )
+        == "warn · not thin · source vs scan"
+    )
+    assert (
+        improve_tick_lean_meta("stuck vs scan align · clash")
+        == "confirm · not thin · stuck vs scan"
+    )
+    # Finished explain-only shares no result · sole (xang1234 #747).
+    assert (
+        improve_tick_lean_meta("stuck band · aging")
+        == "confirm · no result · sole · stuck band"
+    )
+    # Hung open fold must not read quiet (xang1234 #746 no-closed honesty).
+    # Sole stuck band names thin reason sole (#747 Small sample).
+    # Calm hung explain-only speaks confirm · hung · no result (peer of
+    # warn · hung · no result).
+    assert (
+        improve_tick_lean_meta("stuck band · aging", stuck=True)
+        == "confirm · hung · no result · sole · stuck band"
+    )
+    # Sole gap sides (no stuck band) also names sole.
+    assert (
+        improve_tick_lean_meta(
+            "gap sides · improve aging · scan fresh", stuck=True
+        )
+        == "confirm · hung · no result · sole · gap sides"
+    )
+    # Gap sides + stuck band → few (Few dates vs Small sample; #747 / 9a12dc1).
+    assert (
+        improve_tick_lean_meta(
+            "stuck band · aging · gap sides · improve aging · scan fresh",
+            stuck=True,
+        )
+        == "confirm · hung · no result · few · stuck band · gap sides"
+    )
+    # Skip no-result with nothing listed (#747 nothing closed);
+    # confirm peer of warn · hung.
+    assert improve_tick_lean_meta("", stuck=True) == "confirm · hung"
+    # Meter stages speak not thin (xang1234 b09fb49 cover a card that is
+    # not thin + 1cd7968 share the small-sample rule). Calm hung meter
+    # leans speak confirm · hung · not thin (speak-both-sides peer of
+    # warn · hung · not thin).
+    assert (
+        improve_tick_lean_meta(
+            "stuck vs scan align · clash · stuck band · aging",
+            stuck=True,
+        )
+        == "confirm · hung · not thin · stuck vs scan · stuck band"
+    )
+    # Warn leads; hung stuck still named; meter shares not thin under
+    # warn · hung (b09fb49 parity — bare warn · hung hid meter honesty).
+    assert (
+        improve_tick_lean_meta(
+            "fresher vs stuck clash · fresher improve · stuck",
+            warn=True,
+            stuck=True,
+        )
+        == "warn · hung · not thin · fresher vs stuck"
+    )
+    # Empty lean + warn + stuck keeps hung under warn (skip not thin).
+    assert improve_tick_lean_meta("", warn=True, stuck=True) == "warn · hung"
+    # Warn + hung + explain-only still names thin sole under warn.
+    assert (
+        improve_tick_lean_meta(
+            "stuck band · aging", warn=True, stuck=True
+        )
+        == "warn · hung · no result · sole · stuck band"
+    )
+    # Explain-only calm hung keeps confirm · hung · no result (peer of
+    # warn · hung · no result — speak-both-sides).
+    assert (
+        improve_tick_lean_meta("stuck band · aging", stuck=True)
+        == "confirm · hung · no result · sole · stuck band"
+    )
+    # Finished warn shares not thin (peer of confirm · not thin).
+    assert (
+        improve_tick_lean_meta(
+            "fresher vs stuck clash · fresher improve · stuck",
+            warn=True,
+            stuck=False,
+        )
+        == "warn · not thin · fresher vs stuck"
+    )
+    assert (
+        improve_tick_lean_meta("fresher improve · gap wide")
+        == "confirm · not thin · fresher"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "fresher improve · gap wide · gap sides · improve fresh · scan stale"
+        )
+        == "confirm · not thin · fresher · gap sides"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "status/age vs scan align · clash · fresher scan · gap wide"
+            " · gap sides · improve stale · scan fresh"
+            " · fresher vs status/age align"
+            " · fresher polarity vs scan-meter align",
+            warn=True,
+        )
+        == (
+            "warn · not thin · fresher polarity vs scan-meter"
+            " · fresher vs status/age · status/age vs scan · fresher · +1"
+        )
+    )
+    assert (
+        improve_tick_lean_meta("fresher vs status/age align")
+        == "confirm · not thin · fresher vs status/age"
+    )
+    assert (
+        improve_tick_lean_meta("fresher vs source align")
+        == "confirm · not thin · fresher vs source"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "fresher vs source clash · fresher improve · start only",
+            warn=True,
+        )
+        == "warn · not thin · fresher vs source"
+    )
+    assert (
+        improve_tick_lean_meta("fresher vs stuck align")
+        == "confirm · not thin · fresher vs stuck"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "fresher vs stuck clash · fresher improve · stuck",
+            warn=True,
+        )
+        == "warn · not thin · fresher vs stuck"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "fresher polarity vs scan-meter align",
+        )
+        == "confirm · not thin · fresher polarity vs scan-meter"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "clash · fresher polarity clash · scan-meter align",
+            warn=True,
+        )
+        == "warn · not thin · fresher polarity vs scan-meter"
+    )
+    assert (
+        improve_tick_lean_meta(
+            "source vs scan align · clash · fresher improve · gap wide"
+            " · gap sides · improve fresh · scan stale"
+            " · fresher vs source clash · fresher improve · start only"
+            " · clash · fresher polarity clash · scan-meter align",
+            warn=True,
+        )
+        == (
+            "warn · not thin · fresher polarity vs scan-meter"
+            " · fresher vs source · source vs scan · fresher · +1"
+        )
+    )
+
+
+def test_improve_tick_lean_meta_refuses_bool_name_cap() -> None:
+    """True must not invent a one-stage Ops improve lean chip."""
+    assert (
+        _coerce_improve_tick_lean_name_cap(True) == _IMPROVE_TICK_LEAN_NAME_CAP
+    )
+    assert (
+        _coerce_improve_tick_lean_name_cap(False) == _IMPROVE_TICK_LEAN_NAME_CAP
+    )
+    assert _coerce_improve_tick_lean_name_cap(0) == _IMPROVE_TICK_LEAN_NAME_CAP
+    assert _coerce_improve_tick_lean_name_cap(None) == _IMPROVE_TICK_LEAN_NAME_CAP
+    assert _coerce_improve_tick_lean_name_cap(2) == 2
+    storm = (
+        "status/age vs scan align · clash · fresher scan · gap wide"
+        " · gap sides · improve stale · scan fresh"
+        " · fresher vs status/age align"
+        " · fresher polarity vs scan-meter align"
+    )
+    # Bool cap falls back to 4 (+1), not stages[:True] → one stage +4.
+    assert improve_tick_lean_meta(storm, warn=True, cap=True) == (
+        "warn · not thin · fresher polarity vs scan-meter"
+        " · fresher vs status/age · status/age vs scan · fresher · +1"
+    )
+    assert improve_tick_lean_meta(storm, warn=True, cap=False) == (
+        "warn · not thin · fresher polarity vs scan-meter"
+        " · fresher vs status/age · status/age vs scan · fresher · +1"
+    )
+    assert improve_tick_lean_meta(storm, warn=True, cap=2) == (
+        "warn · not thin · fresher polarity vs scan-meter"
+        " · fresher vs status/age · +3"
+    )
+
+
+def test_improve_tick_lean_open() -> None:
+    # Calm finished tick with no lean — closed.
+    assert improve_tick_lean_open(lean="", lean_warn=False, stuck=False) is False
+    # Warn opens even without stuck.
+    assert improve_tick_lean_open(
+        lean="clash · source loop tick · scan fresh",
+        lean_warn=True,
+        stuck=False,
+    )
+    # Hung stuck with explain-only band stays open (xang1234 all-dropped).
+    assert improve_tick_lean_open(
+        lean="stuck band · aging", lean_warn=False, stuck=True
+    )
+    # Stuck without lean body stays closed.
+    assert improve_tick_lean_open(lean="", lean_warn=False, stuck=True) is False
+    # Finished tick with quiet lean stays closed.
+    assert improve_tick_lean_open(
+        lean="fresher improve · gap wide", lean_warn=False, stuck=False
+    ) is False
+
+
+def test_improve_tick_glance_start_only_speaks_and_ages(tmp_path: Path) -> None:
+    """Start without end is not a finished tick — speak + escalate fresh."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T20:46Z cursor improve start\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T21:00Z")
+    )
+    assert g["ready"] is True
+    assert g["source"] == "cursor start"
+    assert g["source_bit"] == "start only"
+    assert g["source_escalate"] is True
+    assert g["freshness"] == "fresh"
+    assert g["tone"] == "aging"
+    assert "start only" in g["line"]
+    assert g["stuck"] is False
+    assert g["stuck_bit"] == ""
+    assert "stuck" not in g["line"]
+
+
+def test_improve_tick_glance_start_only_aging_speaks_stuck(
+    tmp_path: Path,
+) -> None:
+    """Hung start past aging → Ops stuck (ignore failed leftover end)."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T16:00Z cursor improve end rc=1\n"
+        "2026-11-09T18:00Z cursor improve start\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T20:00Z")
+    )
+    assert g["ready"] is True
+    assert g["source"] == "cursor start"
+    assert g["source_bit"] == "start only"
+    assert g["freshness"] == "aging"
+    assert g["rc"] is None
+    assert g["failed"] is False
+    assert g["stuck"] is True
+    assert g["stuck_bit"] == "stuck"
+    assert "start only" in g["line"]
+    assert "stuck" in g["line"]
+    # Failed leftover end must not own the clock (xang1234 0be5b49).
+    assert "rc=1" not in g["line"]
+    # No scan → stuck vs scan lean silent; stuck band still explains age.
+    assert "stuck vs scan" not in g["lean"]
+    assert "stuck band · aging" in g["lean"]
+    assert "stuck band" in g["lean_meta"]
+    assert g["lean_meta"].startswith("confirm · hung ·")
+    assert "quiet" not in g["lean_meta"]
+    assert "stuck band" not in g["line"]
+    # Explain-only hung lean stays open (xang1234 #745 all-dropped);
+    # sole stuck band → confirm · hung · no result · sole (peer of warn).
+    assert g["lean_warn"] is False
+    assert g["lean_open"] is True
+    assert g["lean_meta"].startswith("confirm · hung · no result · sole")
+    assert "quiet" not in g["lean_meta"]
+
+
+def test_improve_tick_glance_stuck_vs_scan_lean(tmp_path: Path) -> None:
+    """Hung stuck + scan clash → lean confirms meter agreement."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T18:00Z cursor improve start\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path,
+        now=_clock("2026-11-09T20:00Z"),
+        scan_time=_clock("2026-11-09T19:55Z"),
+        scan_interval_sec=900,
+    )
+    assert g["ready"] is True
+    assert g["stuck"] is True
+    assert g["stuck_bit"] == "stuck"
+    assert g["scan_clash"]
+    assert "stuck vs scan align · clash" in g["lean"]
+    assert "source vs scan align · clash" in g["lean"]
+    assert "stuck band · aging" in g["lean"]
+    # Fresh scan ahead of hung aging improve → fresher vs stuck align.
+    assert "fresher scan" in g["lean"]
+    assert "fresher vs stuck align" in g["lean"]
+    assert "fresher vs source align" in g["lean"]
+    # Hung peers both confirm → stuck peers align · both align.
+    assert "stuck peers align · both align" in g["lean"]
+    assert "stuck peers" in g["lean_meta"]
+    assert "fresher vs stuck" in g["lean_meta"]
+    # Outer bridge when fresher polarity/scan-meter also spoke.
+    if "fresher polarity vs scan-meter" in g["lean"]:
+        assert "peers↔ vs fpm align · both align" in g["lean"]
+        assert "peers↔ vs fpm" in g["lean_meta"]
+    # Cap-4 meta may push stuck vs scan into +N; body still lists it.
+    assert (
+        "stuck vs scan" in g["lean_meta"]
+        or "+4" in g["lean_meta"]
+        or "+5" in g["lean_meta"]
+        or "+6" in g["lean_meta"]
+    )
+    # Cap-4 meta +N still covers stuck band / fresher / gap sides in body.
+    assert (
+        "+4" in g["lean_meta"]
+        or "+5" in g["lean_meta"]
+        or "+6" in g["lean_meta"]
+        or "stuck band" in g["lean_meta"]
+    )
+    # Warn (fresher polarity) wins over confirm · hung · not thin;
+    # sole/few thin absent.
+    assert "no result" not in g["lean_meta"]
+    assert g["lean_meta"].startswith("warn ·") or g[
+        "lean_meta"
+    ].startswith("confirm · hung · not thin")
+    # Primary clip keeps age · stuck; lean holds meter agreement + band.
+    assert "stuck" in g["line"]
+    assert "stuck vs scan" not in g["line"]
+    assert "stuck peers" not in g["line"]
+    assert "peers↔" not in g["line"]
+    assert "stuck band" not in g["line"]
+    assert "fresher vs stuck" not in g["line"]
+    assert g["lean_open"] is True
+
+
+def test_improve_tick_glance_fresher_vs_stuck_clash(tmp_path: Path) -> None:
+    """Hung stuck claiming fresher than stale scan → lean warns."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T18:00Z cursor improve start\n",
+        encoding="utf-8",
+    )
+    # Improve aging (2h) vs scan stale (>36h at 900s interval → stale band).
+    g = build_improve_tick_glance(
+        tmp_path,
+        now=_clock("2026-11-09T20:00Z"),
+        scan_time=_clock("2026-11-08T00:00Z"),
+        scan_interval_sec=900,
+    )
+    assert g["ready"] is True
+    assert g["stuck"] is True
+    assert g["freshness"] == "aging"
+    assert g["scan_freshness"] == "stale"
+    assert "fresher improve" in g["lean"]
+    assert "fresher vs stuck clash · fresher improve · stuck" in g["lean"]
+    assert "fresher vs source clash" in g["lean"]
+    # Stuck-scan confirm + fresher↔stuck clash → hung peers mixed warn.
+    assert "stuck vs scan align · clash" in g["lean"]
+    assert (
+        "clash · stuck peers · stuck-scan align · fresher↔stuck clash"
+        in g["lean"]
+    )
+    # Outer bridge when fresher polarity/scan-meter also warned.
+    if "fresher polarity vs scan-meter" in g["lean"] or "scan-meter" in g[
+        "lean"
+    ]:
+        assert "peers↔ vs fpm" in g["lean"]
+        assert "peers↔ vs fpm" in g["lean_meta"]
+    assert "stuck peers" in g["lean_meta"]
+    assert "fresher vs stuck" in g["lean_meta"]
+    assert g["lean_warn"] is True
+    assert g["lean_open"] is True
+    assert g["lean_meta"].startswith("warn · hung ·")
+    assert "fresher vs stuck" not in g["line"]
+    assert "stuck peers" not in g["line"]
+    assert "peers↔" not in g["line"]
+
+
+def test_improve_tick_glance_stuck_band_stale(tmp_path: Path) -> None:
+    """Stale hung escalate → lean speaks stuck band · stale."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T12:00Z cursor improve start\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T20:00Z")
+    )
+    assert g["ready"] is True
+    assert g["freshness"] == "stale"
+    assert g["stuck"] is True
+    assert "stuck band · stale" in g["lean"]
+    assert "stuck band" in g["lean_meta"]
+    assert "stuck" in g["line"]
+    assert "stuck band" not in g["line"]
+    assert g["lean_open"] is True
+
+
+def test_improve_tick_glance_failed_end_stale_not_stuck(
+    tmp_path: Path,
+) -> None:
+    """Completed fail is status/age — not Ops stuck."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T12:00Z cursor improve end rc=1\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T20:00Z")
+    )
+    assert g["ready"] is True
+    assert g["failed"] is True
+    assert g["stuck"] is False
+    assert g["stuck_bit"] == ""
+    assert "stuck" not in g["line"]
+
+
+def test_improve_tick_glance_loop_tick_stale_not_stuck(
+    tmp_path: Path,
+) -> None:
+    """Leftover wake heartbeat must not judge stuck (xang1234 0be5b49)."""
+    (tmp_path / "run_improve_loop.log").write_text(
+        '2026-11-09T12:00Z AGENT_LOOP_TICK_improve {"prompt": "x"}\n',
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T20:00Z")
+    )
+    assert g["ready"] is True
+    assert g["source"] == "loop tick"
+    assert g["freshness"] == "stale"
+    assert g["stuck"] is False
+    assert g["stuck_bit"] == ""
+    assert "stuck" not in g["line"]
+
+
+def test_improve_tick_glance_log_mtime_speaks_and_ages(tmp_path: Path) -> None:
+    """Truncated log mtime ≠ finished end — speak + escalate fresh."""
+    log = tmp_path / "run_cursor_improve.log"
+    log.write_text("garbage not a tick line\n", encoding="utf-8")
+    # Force mtime into the fresh window relative to fixed now.
+    now = _clock("2026-11-09T21:00Z")
+    os.utime(log, (now.timestamp() - 600, now.timestamp() - 600))
+    g = build_improve_tick_glance(tmp_path, now=now)
+    assert g["ready"] is True
+    assert g["source"] == "cursor log"
+    assert g["source_bit"] == "log mtime"
+    assert g["source_escalate"] is True
+    assert g["freshness"] == "fresh"
+    assert g["tone"] == "aging"
+    assert "log mtime" in g["line"]
+
+
+def test_improve_tick_glance_aging(tmp_path: Path) -> None:
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T18:00Z cursor improve end rc=0\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T20:00Z")
+    )
+    assert g["ready"] is True
+    assert g["freshness"] == "aging"
+    assert g["tone"] == "aging"
+    assert g["status_age_bit"] == ""
+    assert IMPROVE_TICK_FRESH_SEC < g["age_sec"] < IMPROVE_TICK_AGING_SEC
+
+
+def test_improve_tick_glance_ok_stale_status_age_clash(tmp_path: Path) -> None:
+    """Success label beside stale age must speak clash (edge/conf parity)."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T12:00Z cursor improve end rc=0\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T20:00Z")
+    )
+    assert g["ready"] is True
+    assert g["freshness"] == "stale"
+    assert g["failed"] is False
+    assert g["rc"] == 0
+    assert g["status_age_bit"] == "status/age clash · ok · stale"
+    assert g["status_age_escalate"] is True
+    assert "status/age clash · ok · stale" in g["line"]
+    assert g["tone"] == "warn"
+    assert g["age_sec"] >= IMPROVE_TICK_AGING_SEC
+
+
+def test_improve_tick_glance_fail_fresh_status_age_clash(tmp_path: Path) -> None:
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T20:46Z cursor improve end rc=1\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T21:00Z")
+    )
+    assert g["ready"] is True
+    assert g["freshness"] == "fresh"
+    assert g["failed"] is True
+    assert g["status_age_bit"] == "status/age clash · fail · fresh"
+    assert g["status_age_escalate"] is True
+    assert "status/age clash · fail · fresh" in g["line"]
+    assert g["tone"] == "warn"
+
+
+def test_improve_tick_glance_stale_and_failed_rc(tmp_path: Path) -> None:
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T12:00Z cursor improve end rc=1\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T20:00Z")
+    )
+    assert g["ready"] is True
+    assert g["freshness"] == "stale"
+    assert g["tone"] == "warn"
+    assert g["failed"] is True
+    assert g["rc"] == 1
+    assert "rc=1" in g["line"]
+    assert g["status_age_bit"] == "status/age align · fail · stale"
+    assert g["status_age_escalate"] is False
+    assert "status/age align · fail · stale" in g["line"]
+    assert g["age_sec"] >= IMPROVE_TICK_AGING_SEC
+
+
+def test_improve_tick_glance_loop_tick_fallback(tmp_path: Path) -> None:
+    (tmp_path / "run_improve_loop.log").write_text(
+        '2026-11-09T20:46Z AGENT_LOOP_TICK_improve {"prompt": "x"}\n',
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path, now=_clock("2026-11-09T21:00Z")
+    )
+    assert g["ready"] is True
+    assert g["source"] == "loop tick"
+    assert g["source_bit"] == "loop tick"
+    assert g["source_escalate"] is False
+    assert g["freshness"] == "fresh"
+    assert g["tone"] == "ok"
+    assert g["rc"] is None
+    assert "loop tick" in g["line"]
+
+
+def test_improve_tick_glance_vs_scan_clash(tmp_path: Path) -> None:
+    """Fresh improve ≠ stale scan archive → clash (LAYA/soft-allow parity)."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T20:46Z cursor improve end rc=0\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path,
+        now=_clock("2026-11-09T21:00Z"),
+        scan_time="2026-11-09T12:00:00+00:00",
+        scan_interval_sec=900,
+    )
+    assert g["ready"] is True
+    assert g["freshness"] == "fresh"
+    assert g["scan_freshness"] == "stale"
+    assert g["scan_clash"] == "clash · scan stale"
+    assert "clash · scan stale" in g["line"]
+    assert g["tone"] == "warn"
+    # Happy ok+fresh has no status/age bit → lean still names fresher/gap + sides.
+    assert g["status_age_bit"] == ""
+    assert g["lean"] == (
+        "fresher improve · gap wide"
+        " · gap sides · improve fresh · scan stale"
+    )
+    assert g["lean_warn"] is False
+    assert g["lean_meta"] == "confirm · not thin · fresher · gap sides"
+    assert "fresher" not in g["line"]
+    assert "gap sides" not in g["line"]
+
+
+def test_improve_tick_glance_status_age_vs_scan_align_clash(
+    tmp_path: Path,
+) -> None:
+    """ok·stale + scan clash → lean confirms both meters disagree."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T12:00Z cursor improve end rc=0\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path,
+        now=_clock("2026-11-09T20:00Z"),
+        scan_time="2026-11-09T19:50:00+00:00",
+        scan_interval_sec=900,
+    )
+    assert g["ready"] is True
+    assert g["freshness"] == "stale"
+    assert g["status_age_bit"] == "status/age clash · ok · stale"
+    assert g["scan_freshness"] == "fresh"
+    assert g["scan_clash"] == "clash · scan fresh"
+    assert g["lean"] == (
+        "status/age vs scan align · clash · fresher scan · gap wide"
+        " · gap sides · improve stale · scan fresh"
+        " · fresher vs status/age align"
+        " · fresher polarity vs scan-meter align"
+    )
+    assert g["lean_warn"] is True
+    assert g["lean_open"] is True
+    assert g["lean_meta"] == (
+        "warn · not thin · fresher polarity vs scan-meter"
+        " · fresher vs status/age · status/age vs scan · fresher · +1"
+    )
+    # Lean stays off the primary clip.
+    assert "status/age vs scan" not in g["line"]
+    assert "fresher" not in g["line"]
+    assert "gap sides" not in g["line"]
+    assert "scan-meter" not in g["line"]
+
+
+def test_improve_tick_glance_status_age_align_vs_scan_clash(
+    tmp_path: Path,
+) -> None:
+    """fail·stale align + scan clash → lean warns moods disagree."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T12:00Z cursor improve end rc=1\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path,
+        now=_clock("2026-11-09T20:00Z"),
+        scan_time="2026-11-09T19:50:00+00:00",
+        scan_interval_sec=900,
+    )
+    assert g["ready"] is True
+    assert g["freshness"] == "stale"
+    assert g["status_age_bit"] == "status/age align · fail · stale"
+    assert g["scan_clash"] == "clash · scan fresh"
+    assert g["lean"] == (
+        "clash · status/age align · scan fresh · fresher scan · gap wide"
+        " · gap sides · improve stale · scan fresh"
+        " · fresher vs status/age align"
+        " · clash · scan-meter · fresher polarity align"
+    )
+    assert g["lean_warn"] is True
+    assert g["lean_open"] is True
+    assert g["lean_meta"] == (
+        "warn · not thin · fresher polarity vs scan-meter"
+        " · fresher vs status/age · status/age vs scan · fresher · +1"
+    )
+    assert "status/age vs scan" not in g["line"]
+    assert "clash · status/age align" not in g["line"]
+    assert "fresher" not in g["line"]
+    assert "gap sides" not in g["line"]
+    assert "scan-meter" not in g["line"]
+
+
+def test_improve_tick_glance_source_vs_scan_align_clash(
+    tmp_path: Path,
+) -> None:
+    """start-only + scan clash → lean confirms both meters disagree."""
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T20:46Z cursor improve start\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path,
+        now=_clock("2026-11-09T21:00Z"),
+        scan_time="2026-11-09T12:00:00+00:00",
+        scan_interval_sec=900,
+    )
+    assert g["ready"] is True
+    assert g["source_bit"] == "start only"
+    assert g["source_escalate"] is True
+    assert g["scan_clash"] == "clash · scan stale"
+    assert g["lean"] == (
+        "source vs scan align · clash · fresher improve · gap wide"
+        " · gap sides · improve fresh · scan stale"
+        " · fresher vs source clash · fresher improve · start only"
+        " · clash · fresher polarity clash · scan-meter align"
+    )
+    assert g["lean_warn"] is True
+    assert g["lean_open"] is True
+    assert g["lean_meta"] == (
+        "warn · not thin · fresher polarity vs scan-meter"
+        " · fresher vs source · source vs scan · fresher · +1"
+    )
+    assert "source vs scan" not in g["line"]
+    assert "fresher" not in g["line"]
+    assert "gap sides" not in g["line"]
+    assert "fresher vs source" not in g["line"]
+    assert "scan-meter" not in g["line"]
+    assert "start only" in g["line"]
+    assert "clash · scan stale" in g["line"]
+
+def test_improve_tick_glance_loop_tick_vs_scan_clash(tmp_path: Path) -> None:
+    """Calm loop-tick source + scan clash → lean warns moods disagree."""
+    (tmp_path / "run_improve_loop.log").write_text(
+        '2026-11-09T20:46Z AGENT_LOOP_TICK_improve {"prompt": "x"}\n',
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path,
+        now=_clock("2026-11-09T21:00Z"),
+        scan_time="2026-11-09T12:00:00+00:00",
+        scan_interval_sec=900,
+    )
+    assert g["ready"] is True
+    assert g["source_bit"] == "loop tick"
+    assert g["source_escalate"] is False
+    assert g["scan_clash"] == "clash · scan stale"
+    assert g["lean"] == (
+        "clash · source loop tick · scan stale · fresher improve · gap wide"
+        " · gap sides · improve fresh · scan stale"
+    )
+    assert g["lean_warn"] is True
+    assert g["lean_meta"] == (
+        "warn · not thin · source vs scan · fresher · gap sides"
+    )
+    # Calm loop tick stays silent on fresher vs source (escalate-only nest).
+    assert "fresher vs source" not in g["lean"]
+    assert "clash · source loop tick" not in g["line"]
+    assert "fresher" not in g["line"]
+    assert "gap sides" not in g["line"]
+    assert "loop tick" in g["line"]
+
+
+def test_improve_tick_glance_fresher_vs_source_align(tmp_path: Path) -> None:
+    """Stale hang + fresher scan → lean confirms both say improve is weak."""
+    log = tmp_path / "run_cursor_improve.log"
+    log.write_text("garbage not a tick line\n", encoding="utf-8")
+    now = _clock("2026-11-09T20:00Z")
+    # Stale mtime relative to now (≥3h).
+    os.utime(log, (now.timestamp() - 8 * 3600, now.timestamp() - 8 * 3600))
+    g = build_improve_tick_glance(
+        tmp_path,
+        now=now,
+        scan_time="2026-11-09T19:50:00+00:00",
+        scan_interval_sec=900,
+    )
+    assert g["ready"] is True
+    assert g["source_bit"] == "log mtime"
+    assert g["source_escalate"] is True
+    assert g["freshness"] == "stale"
+    assert g["stuck"] is True
+    assert g["scan_freshness"] == "fresh"
+    assert g["scan_clash"] == "clash · scan fresh"
+    assert "fresher vs source align" in g["lean"]
+    assert "fresher vs source clash" not in g["lean"]
+    assert "fresher polarity vs scan-meter align" in g["lean"]
+    assert "fresher polarity vs scan-meter align · clash" not in g["lean"]
+    assert "stuck vs scan align · clash" in g["lean"]
+    assert g["lean"].startswith("source vs scan align · clash")
+    assert "fresher scan · gap wide" in g["lean"]
+    assert "gap sides · improve stale · scan fresh" in g["lean"]
+    # fresher scan still warns (ahead scan ≠ live improve); source/stuck align stay calm.
+    # Warn leads; hung stuck + not thin (meter honesty under warn · hung).
+    # Stuck peers + fpm both spoke → outer bridge invents first.
+    assert g["lean_warn"] is True
+    assert "stuck peers align · both align" in g["lean"]
+    assert "peers↔ vs fpm align · both align" in g["lean"]
+    assert g["lean_meta"].startswith("warn · hung · not thin · peers↔ vs fpm")
+    assert "stuck peers" in g["lean_meta"]
+    assert "fresher polarity vs scan-meter" in g["lean_meta"] or "+4" in g[
+        "lean_meta"
+    ] or "+5" in g["lean_meta"] or "+6" in g["lean_meta"]
+    assert (
+        "stuck vs scan" in g["lean_meta"]
+        or "+4" in g["lean_meta"]
+        or "+5" in g["lean_meta"]
+        or "+6" in g["lean_meta"]
+    )
+    assert "fresher vs source" not in g["line"]
+    assert "scan-meter" not in g["line"]
+    assert "stuck vs scan" not in g["line"]
+    assert "stuck peers" not in g["line"]
+    assert "peers↔" not in g["line"]
+    assert "log mtime" in g["line"]
+    assert "stuck" in g["line"]
+
+def test_improve_tick_glance_vs_scan_same_band_silent(tmp_path: Path) -> None:
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T20:46Z cursor improve end rc=0\n",
+        encoding="utf-8",
+    )
+    g = build_improve_tick_glance(
+        tmp_path,
+        now=_clock("2026-11-09T21:00Z"),
+        scan_time="2026-11-09T20:50:00+00:00",
+        scan_interval_sec=900,
+    )
+    assert g["ready"] is True
+    assert g["freshness"] == "fresh"
+    assert g["scan_freshness"] == "fresh"
+    assert g["scan_clash"] == ""
+    assert "clash" not in g["line"]
+    assert g["tone"] == "ok"
+    assert g["lean"] == ""
+
+
+def test_improve_tick_glance_in_snapshot(tmp_path: Path) -> None:
+    (tmp_path / "portfolio.json").write_text(
+        '{"cash": 100000, "initial_cash": 100000, "holdings": {}, '
+        '"total_fees_paid": 0}',
+        encoding="utf-8",
+    )
+    (tmp_path / "trades.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T20:46Z cursor improve end rc=0\n",
+        encoding="utf-8",
+    )
+    snap = load_desk_snapshot(tmp_path, live_marks=False)
+    g = snap["improve_tick_glance"]
+    assert g["ready"] is True
+    assert g["freshness"] in {"fresh", "aging", "stale"}
+
+
+def test_improve_tick_glance_in_chart_payload(tmp_path: Path) -> None:
+    (tmp_path / "portfolio.json").write_text(
+        '{"cash": 100000, "initial_cash": 100000, "holdings": {}, '
+        '"total_fees_paid": 0}',
+        encoding="utf-8",
+    )
+    (tmp_path / "trades.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "run_cursor_improve.log").write_text(
+        "2026-11-09T20:46Z cursor improve end rc=0\n",
+        encoding="utf-8",
+    )
+    g = load_chart_payload(tmp_path)["improve_tick_glance"]
+    assert g["ready"] is True
+    assert "fresh" in g["line"] or "aging" in g["line"] or "stale" in g["line"]

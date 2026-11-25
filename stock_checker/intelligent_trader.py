@@ -1,0 +1,1921 @@
+#!/usr/bin/env python3
+
+"""
+Intelligent trader — continuous scan + paper book management.
+
+Combines market scanning with paper trading to:
+1. Scan markets on compose interval (default 15m) for top opportunities
+2. Trade/check on compose interval (default 5m): marks, TP/SL, trim, entries
+3. Apply soft entry gates (regime / RS / breadth / earnings / optional promote)
+4. Exit via exit_policy only (champion promote does not own exits)
+"""
+
+from typing import List, Dict, Tuple
+import time
+import traceback
+from datetime import datetime, timezone
+from .market_scanner import MarketScanner
+from .portfolio import Portfolio
+from .persistence import DataPersistence
+from .symbol_filters import is_tradeable_symbol
+from .earnings_guard import is_in_earnings_blackout
+from .gate_audit import log_soft_allow
+from .fetcher import is_transient_network_error
+from .secret_redact import redact_secrets, safe_exc_text
+from .market_regime import (
+    CRYPTO_BENCHMARK,
+    CRYPTO_SMA_PERIOD,
+    REGIME_UNKNOWN,
+    STOCK_BENCHMARK,
+    STOCK_SMA_PERIOD,
+    classify_close_vs_sma,
+    closes_from_binance_klines,
+    closes_from_yfinance_hist,
+    regime_gate_enabled,
+    save_regime_snapshot,
+    simple_sma,
+    snapshot_dict,
+)
+from .relative_strength import (
+    DEFAULT_RS_LOOKBACK,
+    new_entry_rs_allowed,
+    rs_gate_enabled,
+    rs_lookback,
+)
+from .scan_breadth_gate import (
+    breadth_gate_enabled,
+    pulse_from_scan_lists,
+    summarize_pulse,
+)
+from .entry_gates import soft_entry_gates_ok
+from .entry_pipeline import apply_promote_entry_filter, order_entry_candidates
+from .trader_cycle import run_one_cycle
+from .paper_calm import upsert_calm_day
+from .exit_policy import (
+    book_action_mode,
+    crypto_entry_price_ok,
+    exit_thresholds_for_asset,
+    mark_price_ok,
+    opportunity_symbol_set,
+    pick_overweight_trim_candidate,
+    should_allow_rebuy,
+    should_rebalance_exit,
+    should_stop_loss,
+    should_take_profit,
+    unrealized_profit_pct,
+)
+from .technical_indicators import (
+    _finite_signed,
+    coerce_nonneg_int,
+    coerce_score,
+    coerce_unix_ts,
+)
+from .market_hours import is_equity_session_closed
+from .crypto_policy import (
+    DEFAULT_MAX_CRYPTO_POSITIONS,
+    crypto_buy_block_reason,
+    crypto_slot_available,
+    is_crypto_symbol,
+)
+from .fees import DEFAULT_FEE_PRESET, free_legs_for_preset, rates_for_preset
+from .trader_config import DEFAULTS as TRADER_DEFAULTS
+from .trade_context import buy_note_from_opportunity, sell_note_from_exit
+from . import __version__
+
+# AI validate scope — top-N only; rest keep scanner score (desk honesty glance).
+AI_VALIDATE_TOP_N = 5
+AI_FULL_TOP_N = 10
+
+
+def _coerce_ai_validate_top_n(
+    value: object, default: int = AI_VALIDATE_TOP_N
+) -> int:
+    """AI top-N strip size, or ``default`` when bool/gap/≤0.
+
+    FinRobot + tradermonty #700/#655 + xang1234/portfolio AI: ``int(True)→1``
+    / ``opportunities[:True]`` must not invent a one-name LLM check strip
+    (MarketScanner ``_coerce_scan_top_n`` peer — validate/full ceilings were
+    still bare module constants).
+    """
+    n = coerce_nonneg_int(value)
+    if n is None or n < 1:
+        return int(default)
+    return n
+
+
+_DEFAULT_MAX_POSITIONS = int(TRADER_DEFAULTS["max_positions"])
+_DEFAULT_MIN_HOLD_SECONDS = int(float(TRADER_DEFAULTS["min_hold_hours"]) * 3600)
+_DEFAULT_SCAN_INTERVAL_SEC = 900
+_DEFAULT_TRADE_INTERVAL_SEC = 300
+_DEFAULT_POSITION_SIZE = 0.10
+_DEFAULT_INITIAL_CASH = 10000.0
+
+
+def _coerce_trader_seconds(value: object, default: int) -> int:
+    """Positive loop/hold seconds, or ``default`` when bool/gap (never ``True→1s``).
+
+    tradermonty #700/#655 + xang1234/portfolio AI: ``int(True)`` must not invent
+    a 1s scan/trade/min-hold (anti-churn floor breach).
+    """
+    n = coerce_nonneg_int(value)
+    if n is None or n <= 0:
+        return int(default)
+    return n
+
+
+def _coerce_trader_slots(value: object, default: int) -> int:
+    """Positive book/crypto slot count, or ``default`` when bool/gap (never ``True→1``)."""
+    n = coerce_nonneg_int(value)
+    if n is None or n <= 0:
+        return int(default)
+    return n
+
+
+def _coerce_trader_frac(value: object, default: float) -> float:
+    """Cash/size fraction in (0, 1], or ``default`` when bool/gap (never ``True→100%``)."""
+    if not _finite_signed(value):
+        return float(default)
+    frac = float(value)  # type: ignore[arg-type]
+    if frac <= 0.0 or frac > 1.0:
+        return float(default)
+    return frac
+
+
+def _coerce_trader_cash(value: object, default: float = _DEFAULT_INITIAL_CASH) -> float:
+    """Starting cash >0, or ``default`` when bool/gap (never ``True→€1``)."""
+    if not _finite_signed(value):
+        return float(default)
+    cash = float(value)  # type: ignore[arg-type]
+    if cash <= 0.0:
+        return float(default)
+    return cash
+
+
+class IntelligentTrader:
+    """
+    Autonomous trading system with continuous market analysis.
+    """
+
+    def __init__(
+        self,
+        initial_cash: float = 10000.0,
+        scan_interval: int = 900,  # 15 minutes
+        trade_interval: int = 300,  # 5 minutes
+        max_positions: int = _DEFAULT_MAX_POSITIONS,
+        position_size: float = 0.10,  # 10% per position
+        rebalance_threshold: float = 0.15,  # unused (legacy print only)
+        min_hold_time: int = _DEFAULT_MIN_HOLD_SECONDS,  # Ops default hours → seconds
+        ai_mode: str = "off",  # off, validate, full
+        ai_model: str = "gemma4:latest",
+        top_crypto_count: int = 1
+    ):
+        # tradermonty #700/#655 + xang1234/portfolio AI: refuse bool knobs —
+        # True→1s scan/hold · True→100% size · True→€1 capital · True→1 slot.
+        cash = _coerce_trader_cash(initial_cash)
+        scan_s = _coerce_trader_seconds(scan_interval, _DEFAULT_SCAN_INTERVAL_SEC)
+        trade_s = _coerce_trader_seconds(trade_interval, _DEFAULT_TRADE_INTERVAL_SEC)
+        max_pos = _coerce_trader_slots(max_positions, _DEFAULT_MAX_POSITIONS)
+        size = _coerce_trader_frac(position_size, _DEFAULT_POSITION_SIZE)
+        hold_s = _coerce_trader_seconds(min_hold_time, _DEFAULT_MIN_HOLD_SECONDS)
+        top_c = _coerce_trader_slots(top_crypto_count, 1)
+        rebal = (
+            float(rebalance_threshold)  # type: ignore[arg-type]
+            if _finite_signed(rebalance_threshold)
+            else 0.15
+        )
+
+        self.top_crypto_count = top_c
+        self.max_crypto_positions = int(DEFAULT_MAX_CRYPTO_POSITIONS)
+        self.scanner = MarketScanner(top_crypto_count=self.top_crypto_count)
+        self.persistence = DataPersistence()
+        rate, min_eur = rates_for_preset(DEFAULT_FEE_PRESET)
+        self.portfolio = Portfolio(
+            cash,
+            commission_rate=rate,
+            commission_min_eur=min_eur,
+            fee_preset=DEFAULT_FEE_PRESET,
+            persistence=self.persistence,
+        )
+
+        self.scan_interval = scan_s
+        self.trade_interval = trade_s
+        self.max_positions = max_pos
+        self.position_size = size
+        self.rebalance_threshold = rebal  # UNUSED — not consulted by buy/sell
+        self.min_hold_time = hold_s
+        self._rebuy_blocks_utc_day = ""
+        self._rebuy_blocks_today = 0
+        self._cycle_had_stop_loss = False
+        # After a stop-loss, block new buys until this epoch (anti revenge-refill).
+        self._buy_block_until = 0.0
+
+        # AI configuration
+        self.ai_mode = ai_mode
+        self.ai_model = ai_model
+        if ai_mode != "off":
+            from .ai_recommender import AIRecommender
+            self.ai_recommender = AIRecommender(model=ai_model)
+        else:
+            self.ai_recommender = None
+
+        self.last_scan_time = 0
+        self.current_opportunities = []
+        self.stock_regime = REGIME_UNKNOWN
+        self.crypto_regime = REGIME_UNKNOWN
+        self._regime_enabled = regime_gate_enabled()
+        self._rs_enabled = rs_gate_enabled()
+        self._rs_lookback = rs_lookback()
+        self._breadth_enabled = breadth_gate_enabled()
+        self._scan_pulse: dict = {}
+        self._last_scan_results: dict = {}
+        self._spy_closes: List[float] = []
+        self._btc_closes: List[float] = []
+        self.promote_experiment_strategy = False
+
+        # Load position entry times from disk (survives restarts)
+        self.position_entry_times = self.persistence.load_entry_times()
+        if self.position_entry_times:
+            print(f"   Loaded {len(self.position_entry_times)} position entry times from disk")
+        self.position_exit_times = self.persistence.load_exit_times()
+        if self.position_exit_times:
+            print(f"   Loaded {len(self.position_exit_times)} exit cooldowns from disk")
+
+        print(f"🤖 Intelligent Trader initialized")
+        print(f"   Capital: €{cash:,.2f}")
+        print(f"   Max positions: {max_pos}")
+        print(f"   Position size: {size*100}%")
+        print(f"   Scan interval: {scan_s}s")
+        print(f"   Trade interval: {trade_s}s")
+        print(f"   Rebalance threshold: UNUSED (legacy={rebal*100:.0f}% print-only)")
+        print(f"   Min hold time: {hold_s}s")
+        print(f"   Regime gate: {'on' if self._regime_enabled else 'off'} "
+              f"(SPY SMA{STOCK_SMA_PERIOD} / BTC SMA{CRYPTO_SMA_PERIOD})")
+        print(f"   RS gate: {'on' if self._rs_enabled else 'off'} "
+              f"(lookback {self._rs_lookback}d vs SPY/BTC)")
+        print(f"   Breadth gate: {'on' if self._breadth_enabled else 'off'} "
+              f"(scan-list A/D)")
+        print(f"   Crypto live: BTC/ETH only · max {self.max_crypto_positions} slot · "
+              f"TP/SL ±10% (stocks TP +8% / SL −5%)")
+        print(f"   Promote champion filter: off (hot-reload from Ops)")
+        print(f"   AI Mode: {ai_mode}")
+        if ai_mode != "off":
+            print(f"   AI Model: {ai_model}")
+        from stock_checker.fee_burn import maybe_print_fee_burn_warning
+
+        maybe_print_fee_burn_warning(str(self.persistence.data_dir))
+
+    def begin_trade_cycle(self) -> None:
+        """Reset per-cycle flags (called from trader_cycle.run_one_cycle)."""
+        self._cycle_had_stop_loss = False
+        try:
+            from .risk_halts import pretrade_status
+
+            from .technical_indicators import _finite_signed
+
+            raw_cash = getattr(self.portfolio, "initial_cash", None)
+            # tradermonty #700/#655: never True→€1 / or 0 into daily-loss capital.
+            initial = (
+                float(raw_cash)  # type: ignore[arg-type]
+                if _finite_signed(raw_cash)
+                else 0.0
+            )
+            raw_block = getattr(self, "_buy_block_until", None)
+            block_until = 0.0
+            if _finite_signed(raw_block):
+                ts = float(raw_block)  # type: ignore[arg-type]
+                if ts > 0:
+                    block_until = ts
+            level, notes = pretrade_status(
+                str(self.persistence.data_dir),
+                initial_cash=initial,
+                buy_block_until=block_until,
+            )
+            if level != "PASS":
+                print(f"   🧭 Pre-trade gate: {level} — {'; '.join(notes)}")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _post_stop_cooldown_seconds(self) -> float:
+        """Block new buys after SL: ≥4h (floor) / ≥1 trade interval (anti refill).
+
+        tradermonty #700/#655: refuse bool trade_interval — True→1s must not
+        invent a thin post-SL cooldown (floor still ≥4h via max).
+        """
+        n = coerce_nonneg_int(getattr(self, "trade_interval", None))
+        interval = n if n is not None and n > 0 else _DEFAULT_TRADE_INTERVAL_SEC
+        return float(max(interval, 4 * 3600))
+
+    def _entries_blocked_this_cycle(self) -> bool:
+        if self._cycle_had_stop_loss:
+            print(
+                "   ⏸️  New buys paused this cycle "
+                "(stop-loss exit — wait for next check)"
+            )
+            return True
+        now = time.time()
+        if now < float(getattr(self, "_buy_block_until", 0.0) or 0.0):
+            left = int(self._buy_block_until - now)
+            print(
+                f"   ⏸️  New buys paused ({left}s left) "
+                f"(post stop-loss cooldown — anti revenge refill)"
+            )
+            return True
+        from .risk_halts import daily_loss_halt
+
+        from .technical_indicators import _finite_signed
+
+        data_dir = str(self.persistence.data_dir)
+        raw_cash = getattr(self.portfolio, "initial_cash", None)
+        # tradermonty #700/#655: never True→€1 / or 0 into daily-loss capital.
+        initial = (
+            float(raw_cash)  # type: ignore[arg-type]
+            if _finite_signed(raw_cash)
+            else 0.0
+        )
+        halt, why, _pnl = daily_loss_halt(data_dir, initial_cash=initial)
+        if halt:
+            print(f"   ⏸️  New buys paused ({why})")
+            return True
+        return False
+
+    def _concentration_ok(self, *, notional: float) -> Tuple[bool, str]:
+        from .risk_halts import concentration_allows
+
+        from .technical_indicators import _finite_signed
+
+        try:
+            equity = float(self.portfolio.get_total_value())
+        except Exception:  # noqa: BLE001
+            raw_cash = getattr(self.portfolio, "initial_cash", None)
+            # tradermonty #700/#655: never True→€1 fallback equity.
+            equity = (
+                float(raw_cash)  # type: ignore[arg-type]
+                if _finite_signed(raw_cash)
+                else 0.0
+            )
+        return concentration_allows(notional=notional, portfolio_value=equity)
+
+    def _arm_post_stop_cooldown(self) -> None:
+        """Extend buy block past this cycle so the next tick cannot refill."""
+        self._cycle_had_stop_loss = True
+        until = time.time() + self._post_stop_cooldown_seconds()
+        self._buy_block_until = max(float(getattr(self, "_buy_block_until", 0.0) or 0.0), until)
+
+    def _scan_entry_allowed(self, opportunity: dict) -> Tuple[bool, str, float]:
+        from .entry_guards import scan_entry_guards
+
+        sym = str(opportunity.get("symbol") or "")
+        is_crypto = is_crypto_symbol(sym) or "-USD" in sym
+        _, sl_thr = exit_thresholds_for_asset(is_crypto=is_crypto)
+        return scan_entry_guards(
+            opportunity,
+            ai_action=opportunity.get("ai_action"),
+            ai_confidence=opportunity.get("ai_confidence"),
+            stop_loss_pct=sl_thr,
+        )
+
+    def _sell_position(
+        self,
+        symbol: str,
+        price: float,
+        quantity: float,
+        timestamp: str,
+        *,
+        exit_reason: str,
+        profit_pct: float | None = None,
+        threshold: float | None = None,
+        detail: str = "",
+    ) -> dict:
+        ctx = sell_note_from_exit(
+            exit_reason=exit_reason,
+            profit_pct=profit_pct,
+            threshold=threshold,
+            detail=detail,
+        )
+        return self.portfolio.sell(symbol, price, quantity, timestamp, context=ctx)
+
+    def should_scan(self) -> bool:
+        """Check if it's time for a new market scan."""
+        return (time.time() - self.last_scan_time) >= self.scan_interval
+
+    def refresh_market_regime(self) -> None:
+        """
+        Update SPY / BTC SMA regimes (+ RS benchmark closes) and persist for Ops.
+
+        Fail-open on fetch errors (unknown → allow new entries).
+        Fetches benchmarks when regime and/or RS gates are enabled.
+        """
+        self._regime_enabled = regime_gate_enabled()
+        self._rs_enabled = rs_gate_enabled()
+        self._rs_lookback = rs_lookback()
+        stock_regime = REGIME_UNKNOWN
+        crypto_regime = REGIME_UNKNOWN
+        stock_sma = stock_close = crypto_sma = crypto_close = None
+        detail_parts: List[str] = []
+        self._spy_closes = []
+        self._btc_closes = []
+
+        if not self._regime_enabled and not self._rs_enabled:
+            self.stock_regime = REGIME_UNKNOWN
+            self.crypto_regime = REGIME_UNKNOWN
+            save_regime_snapshot(
+                self.persistence.data_dir,
+                snapshot_dict(
+                    stock_regime=stock_regime,
+                    crypto_regime=crypto_regime,
+                    enabled=False,
+                    detail="REGIME_GATE=0",
+                ),
+            )
+            print("   📉 Regime gate off · RS gate off")
+            return
+
+        if not self._regime_enabled:
+            print("   📉 Regime gate off (REGIME_GATE=0)")
+
+        btc_limit = max(CRYPTO_SMA_PERIOD, self._rs_lookback) + 5
+
+        try:
+            from .fetcher import StockFetcher
+
+            hist = StockFetcher().get_historical_data(
+                STOCK_BENCHMARK, period="1y", interval="1d"
+            )
+            closes = closes_from_yfinance_hist(hist)
+            self._spy_closes = list(closes)
+            stock_regime = classify_close_vs_sma(closes, STOCK_SMA_PERIOD)
+            stock_sma = simple_sma(closes, STOCK_SMA_PERIOD)
+            stock_close = float(closes[-1]) if closes else None
+            detail_parts.append(f"SPY={stock_regime}")
+        except Exception as e:
+            detail_parts.append(f"SPY fetch failed: {safe_exc_text(e, limit=80)}")
+            if not is_transient_network_error(e):
+                print(f"   ⚠️ Regime SPY: {safe_exc_text(e)}")
+
+        try:
+            from .binance_fetcher import BinanceFetcher
+
+            klines = BinanceFetcher().get_klines(
+                CRYPTO_BENCHMARK, interval="1d", limit=btc_limit
+            )
+            closes = closes_from_binance_klines(klines)
+            self._btc_closes = list(closes)
+            crypto_regime = classify_close_vs_sma(closes, CRYPTO_SMA_PERIOD)
+            crypto_sma = simple_sma(closes, CRYPTO_SMA_PERIOD)
+            crypto_close = float(closes[-1]) if closes else None
+            detail_parts.append(f"BTC={crypto_regime}")
+        except Exception as e:
+            detail_parts.append(f"BTC fetch failed: {safe_exc_text(e, limit=80)}")
+            if not is_transient_network_error(e):
+                print(f"   ⚠️ Regime BTC: {safe_exc_text(e)}")
+
+        self.stock_regime = stock_regime
+        self.crypto_regime = crypto_regime
+        snap = snapshot_dict(
+            stock_regime=stock_regime,
+            crypto_regime=crypto_regime,
+            stock_sma=stock_sma,
+            crypto_sma=crypto_sma,
+            stock_close=stock_close,
+            crypto_close=crypto_close,
+            enabled=self._regime_enabled,
+            detail="; ".join(detail_parts),
+        )
+        save_regime_snapshot(self.persistence.data_dir, snap)
+        if self._regime_enabled:
+            print(
+                f"   📉 Regime: SPY {stock_regime} (SMA{STOCK_SMA_PERIOD}) · "
+                f"BTC {crypto_regime} (SMA{CRYPTO_SMA_PERIOD})"
+            )
+        if self._rs_enabled:
+            print(
+                f"   📐 RS gate on (lookback {self._rs_lookback}d · "
+                f"SPY bars={len(self._spy_closes)} · BTC bars={len(self._btc_closes)})"
+            )
+
+    def _asset_closes_for_rs(
+        self, symbol: str, is_crypto: bool, *, fetcher=None, binance=None
+    ) -> List[float]:
+        """Daily closes for RS check; empty list on failure (fail-open upstream)."""
+        need = max(self._rs_lookback, DEFAULT_RS_LOOKBACK) + 5
+        try:
+            if is_crypto:
+                from .binance_fetcher import BinanceFetcher
+
+                client = binance or BinanceFetcher()
+                bsym = client.convert_symbol(symbol)
+                klines = client.get_klines(bsym, interval="1d", limit=need)
+                return closes_from_binance_klines(klines)
+            from .fetcher import StockFetcher
+
+            sf = fetcher or StockFetcher()
+            hist = sf.get_historical_data(symbol, period="1y", interval="1d")
+            return closes_from_yfinance_hist(hist)
+        except Exception as e:
+            if not is_transient_network_error(e):
+                print(f"   ⚠️ RS history {symbol}: {safe_exc_text(e, limit=100)}")
+            return []
+
+    def _rs_entry_ok(
+        self, symbol: str, is_crypto: bool, *, fetcher=None, binance=None
+    ) -> Tuple[bool, str]:
+        """Soft RS gate using cached SPY/BTC closes + per-symbol history."""
+        if not self._rs_enabled:
+            return True, "RS gate off"
+        asset_closes = self._asset_closes_for_rs(
+            symbol, is_crypto, fetcher=fetcher, binance=binance
+        )
+        ok, why = new_entry_rs_allowed(
+            symbol=str(symbol),
+            is_crypto=is_crypto,
+            asset_closes=asset_closes,
+            spy_closes=self._spy_closes,
+            btc_closes=self._btc_closes,
+            lookback=self._rs_lookback,
+            enabled=True,
+        )
+        return ok, why
+
+    def _record_exit(self, symbol: str) -> None:
+        """Persist exit time so we do not flip-flop rebuy the same name."""
+        self.position_exit_times[symbol] = time.time()
+        self.persistence.save_exit_times(self.position_exit_times)
+        if symbol in self.position_entry_times:
+            del self.position_entry_times[symbol]
+            self.persistence.save_entry_times(self.position_entry_times)
+
+    def _rebuy_allowed(self, symbol: str) -> Tuple[bool, str]:
+        """Block buys inside min-hold cooldown after an exit (fee anti-churn)."""
+        raw_exit = self.position_exit_times.get(symbol)
+        exit_ts = coerce_unix_ts(raw_exit)
+        if raw_exit is not None and exit_ts is None:
+            # Damaged/bool stamp present → treat as just exited (fail-closed).
+            # True→1.0 must not invent ~1970 cooldown-clear.
+            since: float | None = 0.0
+        elif exit_ts is not None:
+            since = time.time() - exit_ts
+        else:
+            since = None
+        ok, why = should_allow_rebuy(
+            seconds_since_exit=since,
+            cooldown_seconds=float(self.min_hold_time),
+        )
+        if not ok:
+            day = datetime.utcnow().strftime("%Y-%m-%d")
+            if self._rebuy_blocks_utc_day != day:
+                self._rebuy_blocks_utc_day = day
+                self._rebuy_blocks_today = 0
+            self._rebuy_blocks_today += 1
+        return ok, why
+
+    def scan_markets(self) -> List[Dict]:
+        """
+        Run comprehensive market scan and return ranked opportunities.
+        """
+        print(f"\n{'='*70}")
+        print(f"🔍  SCANNING MARKETS - {datetime.now().strftime('%H:%M:%S')}")
+        print(f"{'='*70}")
+
+        self.refresh_market_regime()
+
+        results = self.scanner.identify_best_opportunities()
+
+        opportunities = results['recommendations']
+        self._last_scan_results = results
+
+        if self.promote_experiment_strategy and opportunities:
+            print(
+                f"\n📐 Promote filter: scoring "
+                f"{sum(1 for o in opportunities if o.get('symbol'))} names vs champion rules..."
+            )
+            opportunities = apply_promote_entry_filter(
+                opportunities, promote_on=True
+            )
+
+        # AI Validation if enabled
+        if self.ai_mode != "off" and self.ai_recommender and opportunities:
+            print(f"\n{'#'*70}")
+            print(f"🤖 AI VALIDATION - {self.ai_mode.upper()} MODE")
+            print(f"   Model: {self.ai_model}")
+            print(f"{'#'*70}\n")
+
+            opportunities = self._ai_validate_opportunities(opportunities)
+
+        self.current_opportunities = opportunities
+        self.last_scan_time = time.time()
+        self._scan_pulse = pulse_from_scan_lists(
+            crypto_leaders=(results or {}).get("crypto_leaders"),
+            stock_breakouts=(results or {}).get("stock_breakouts"),
+            recommendations=opportunities,
+        )
+        if self._breadth_enabled:
+            print(f"   📊 Breadth pulse: {summarize_pulse(self._scan_pulse)}")
+        self._refresh_paper_calm()
+
+        return self.current_opportunities
+
+    def _refresh_paper_calm(self) -> None:
+        """Upsert today's calm-paper streak (promote → compose-default gate)."""
+        snap = upsert_calm_day(
+            self.persistence.data_dir,
+            promote_on=bool(self.promote_experiment_strategy),
+            holdings_count=len(self.portfolio.holdings),
+            max_positions=int(self.max_positions),
+            flip_flop_blocked_today=int(self._rebuy_blocks_today),
+        )
+        # tradermonty #700/#655: refuse bool — int(True or 0) invents 1/1 calm.
+        from stock_checker.technical_indicators import coerce_nonneg_int
+
+        streak = coerce_nonneg_int(snap.get("streak_days")) or 0
+        need = coerce_nonneg_int(snap.get("required_days")) or 30
+        ready = bool(snap.get("ready_for_compose_default"))
+        print(
+            f"   🕊️  Paper calm: {streak}/{need} days"
+            f"{' — READY for compose promote default' if ready else ''}"
+            f" ({snap.get('detail') or ''})"
+        )
+
+    def _soft_gates_ok(self, symbol: str, is_crypto: bool, *, fetcher=None, binance=None) -> Tuple[bool, str]:
+        """Regime → RS → breadth (shared by new trades and rebalance buys)."""
+        return soft_entry_gates_ok(
+            is_crypto=is_crypto,
+            stock_regime=self.stock_regime,
+            crypto_regime=self.crypto_regime,
+            regime_enabled=self._regime_enabled,
+            rs_check=lambda: self._rs_entry_ok(
+                str(symbol), is_crypto, fetcher=fetcher, binance=binance
+            ),
+            breadth_pulse=self._scan_pulse,
+            breadth_enabled=self._breadth_enabled,
+        )
+
+    def _ai_validate_opportunities(self, opportunities: List[Dict]) -> List[Dict]:
+        """
+        Use AI to validate trading opportunities.
+
+        In 'validate' mode: Only validate top opportunities
+        In 'full' mode: Get AI recommendations for all
+        """
+        from .fetcher import StockFetcher
+        from .binance_fetcher import BinanceFetcher
+        from stock_checker.ai_validate_memory import record_ai_validate
+        import sys
+
+        try:
+            import yfinance as yf
+            yfinance_available = True
+        except ImportError:
+            yfinance_available = False
+            print("   ⚠️  yfinance not available - P/E and volume data may be limited")
+            sys.stdout.flush()
+
+        fetcher = StockFetcher()
+        binance = BinanceFetcher()
+        validated_opportunities = []
+
+        # Limit validation to top N opportunities to save AI calls.
+        # Refuse bool — int(True)→1 / [:True] invents a one-name LLM strip.
+        if self.ai_mode == "validate":
+            max_to_validate = _coerce_ai_validate_top_n(
+                AI_VALIDATE_TOP_N, default=AI_VALIDATE_TOP_N
+            )
+        else:
+            max_to_validate = _coerce_ai_validate_top_n(
+                AI_FULL_TOP_N, default=AI_FULL_TOP_N
+            )
+        opportunities_to_check = opportunities[:max_to_validate]
+
+        print(f"   Validating top {len(opportunities_to_check)} opportunities with AI...")
+        sys.stdout.flush()
+
+        for i, opp in enumerate(opportunities_to_check, 1):
+            symbol = opp['symbol']
+            strategy = opp.get('strategy', 'unknown')
+
+            print(f"\n   [{i}/{len(opportunities_to_check)}] Analyzing {symbol} ({strategy})...")
+            sys.stdout.flush()
+
+            try:
+                # Fetch detailed data for AI analysis
+                is_crypto = "-USD" in symbol
+
+                if is_crypto:
+                    binance_symbol = binance.convert_symbol(symbol)
+                    crypto_data = binance.get_crypto_price(binance_symbol)
+                    if not crypto_data:
+                        print(f"   ⚠️  Could not fetch data for {symbol}, skipping AI validation")
+                        sys.stdout.flush()
+                        validated_opportunities.append(opp)
+                        continue
+
+                    # Build stock_data format for AIRecommender
+                    stock_data = {
+                        "symbol": symbol,
+                        "name": symbol,
+                        "current_price": crypto_data.get("current_price"),
+                        "previous_close": crypto_data.get("current_price"),  # Crypto doesn't have prev close
+                        "52_week_high": crypto_data.get("current_price") * 1.5,  # Approximate
+                        "52_week_low": crypto_data.get("current_price") * 0.5,   # Approximate
+                        "pe_ratio": None,
+                        "volume": None,
+                    }
+
+                    # Try to enrich crypto with yfinance data
+                    if yfinance_available:
+                        try:
+                            ticker = yf.Ticker(symbol)
+                            info = ticker.info
+
+                            # Get 52-week range from yfinance if available
+                            if info.get("fiftyTwoWeekHigh"):
+                                stock_data["52_week_high"] = info.get("fiftyTwoWeekHigh")
+                            if info.get("fiftyTwoWeekLow"):
+                                stock_data["52_week_low"] = info.get("fiftyTwoWeekLow")
+
+                            # Get volume if available
+                            if info.get("volume") or info.get("regularMarketVolume"):
+                                stock_data["volume"] = info.get("volume") or info.get("regularMarketVolume")
+
+                            # Update previous close if available
+                            if info.get("previousClose"):
+                                stock_data["previous_close"] = info.get("previousClose")
+
+                        except Exception:
+                            pass  # Silently fail - crypto data is approximate anyway
+                else:
+                    stock_info = fetcher.get_stock_info(symbol)
+                    if not stock_info or not stock_info.get("current_price"):
+                        print(f"   ⚠️  Could not fetch data for {symbol}, skipping AI validation")
+                        sys.stdout.flush()
+                        validated_opportunities.append(opp)
+                        continue
+
+                    stock_data = {
+                        "symbol": symbol,
+                        "name": stock_info.get("name", symbol),
+                        "current_price": stock_info.get("current_price"),
+                        "previous_close": stock_info.get("previous_close"),
+                        "52_week_high": stock_info.get("52_week_high"),
+                        "52_week_low": stock_info.get("52_week_low"),
+                        "pe_ratio": stock_info.get("pe_ratio"),
+                        "volume": stock_info.get("volume"),
+                    }
+
+                # Enrich with yfinance if data is missing
+                if yfinance_available and (not stock_data.get("pe_ratio") or not stock_data.get("volume")):
+                    try:
+                        ticker = yf.Ticker(symbol)
+                        info = ticker.info
+
+                        if not stock_data.get("pe_ratio"):
+                            stock_data["pe_ratio"] = info.get("trailingPE") or info.get("forwardPE")
+
+                        if not stock_data.get("volume"):
+                            stock_data["volume"] = info.get("volume") or info.get("regularMarketVolume")
+
+                        if not stock_data.get("52_week_high"):
+                            stock_data["52_week_high"] = info.get("fiftyTwoWeekHigh")
+
+                        if not stock_data.get("52_week_low"):
+                            stock_data["52_week_low"] = info.get("fiftyTwoWeekLow")
+
+                    except Exception:
+                        pass  # Silently fail - not critical
+
+                # Get AI recommendation
+                ai_result = self.ai_recommender.get_ai_recommendation(stock_data)
+
+                # Backend down → keep scanner candidate (do not freeze cash).
+                if str(ai_result.get("parse_mode") or "") == "unavailable":
+                    print(
+                        f"   ⚠️  {symbol}: AI unavailable — fail-open "
+                        f"(scanner rules keep)"
+                    )
+                    sys.stdout.flush()
+                    # Leave ai_action unset so entry guards stay rules-only.
+                    opp["ai_validated"] = False
+                    opp.pop("ai_action", None)
+                    opp.pop("ai_confidence", None)
+                    opp["ai_reasoning"] = (ai_result.get("reasons") or [""])[0]
+                    record_ai_validate(
+                        self.persistence.data_dir,
+                        ai_result,
+                        symbol=symbol,
+                        kept=True,
+                    )
+                    validated_opportunities.append(opp)
+                    continue
+
+                # Apply AI filtering based on mode
+                if self.ai_mode == "validate":
+                    # In validate mode: Keep if AI says BUY or HOLD (reject only if SELL)
+                    if ai_result['action'] == 'SELL':
+                        print(f"   ❌ {symbol}: AI recommends SELL - filtering out")
+                        print(f"      Reasoning: {ai_result['reasons'][0]}")
+                        sys.stdout.flush()
+                        record_ai_validate(
+                            self.persistence.data_dir,
+                            ai_result,
+                            symbol=symbol,
+                            kept=False,
+                        )
+                        continue
+                    elif ai_result['action'] == 'HOLD':
+                        conf = str(ai_result.get('confidence') or '').upper()
+                        if conf == 'LOW':
+                            print(
+                                f"   ❌ {symbol}: AI HOLD (LOW confidence) — filtering out"
+                            )
+                            print(f"      Reasoning: {ai_result['reasons'][0]}")
+                            sys.stdout.flush()
+                            record_ai_validate(
+                                self.persistence.data_dir,
+                                ai_result,
+                                symbol=symbol,
+                                kept=False,
+                            )
+                            continue
+                        print(
+                            f"   ⚠️  {symbol}: AI suggests HOLD (neutral) "
+                            f"- keeping with lower confidence"
+                        )
+                        sys.stdout.flush()
+                        # Lower the opportunity score (refuse bool/gap invent)
+                        base = coerce_score(opp.get("score"))
+                        if base is not None:
+                            opp["score"] = base * 0.7
+                    else:  # BUY
+                        print(f"   ✅ {symbol}: AI confirms BUY")
+                        print(f"      Reasoning: {ai_result['reasons'][0]}")
+                        sys.stdout.flush()
+                        # Boost the score (refuse bool/gap invent)
+                        base = coerce_score(opp.get("score"))
+                        if base is not None:
+                            opp["score"] = base * 1.2
+
+                    # Add AI metadata
+                    opp['ai_validated'] = True
+                    opp['ai_action'] = ai_result['action']
+                    opp['ai_confidence'] = ai_result['confidence']
+                    opp['ai_score'] = ai_result['score']
+                    opp['ai_reasoning'] = ai_result['reasons'][0]
+                    record_ai_validate(
+                        self.persistence.data_dir,
+                        ai_result,
+                        symbol=symbol,
+                        kept=True,
+                    )
+                    # Optional LAYA/JEV System-1 advisory (fail-open; not a gate).
+                    try:
+                        from stock_checker.laya_decision import maybe_advise_paper_entry
+
+                        laya_stock = dict(stock_data)
+                        laya_stock["strategy"] = strategy
+                        laya_res = maybe_advise_paper_entry(
+                            laya_stock, self.persistence.data_dir
+                        )
+                        if laya_res is not None:
+                            opp["laya_entry"] = laya_res.get("entry")
+                            opp["laya_fail_open"] = bool(laya_res.get("fail_open"))
+                            if laya_res.get("ok"):
+                                print(
+                                    f"   LAYA advisory: {symbol} → "
+                                    f"{laya_res.get('entry')}"
+                                )
+                            else:
+                                print(
+                                    f"   LAYA fail-open: {symbol} · "
+                                    f"{laya_res.get('reason')}"
+                                )
+                            sys.stdout.flush()
+                    except Exception:
+                        pass
+
+                elif self.ai_mode == "full":
+                    # In full mode: Use AI score heavily
+                    if ai_result['score'] < -20:
+                        print(f"   ❌ {symbol}: AI score {ai_result['score']} too negative - filtering out")
+                        sys.stdout.flush()
+                        record_ai_validate(
+                            self.persistence.data_dir,
+                            ai_result,
+                            symbol=symbol,
+                            kept=False,
+                        )
+                        continue
+                    elif ai_result['score'] < 20:
+                        print(f"   ⚠️  {symbol}: AI score {ai_result['score']} low - keeping with caution")
+                        sys.stdout.flush()
+                        opp['score'] = ai_result['score']
+                    else:
+                        print(f"   ✅ {symbol}: AI score {ai_result['score']} - strong signal")
+                        sys.stdout.flush()
+                        opp['score'] = ai_result['score']
+
+                    opp['ai_validated'] = True
+                    opp['ai_action'] = ai_result['action']
+                    opp['ai_confidence'] = ai_result['confidence']
+                    opp['ai_score'] = ai_result['score']
+                    opp['ai_reasoning'] = ai_result['reasons'][0]
+                    record_ai_validate(
+                        self.persistence.data_dir,
+                        ai_result,
+                        symbol=symbol,
+                        kept=True,
+                    )
+
+                validated_opportunities.append(opp)
+
+            except Exception as e:
+                print(f"   ⚠️  AI validation error for {symbol}: {safe_exc_text(e)}")
+                sys.stdout.flush()
+                if not is_transient_network_error(e):
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                # Keep opportunity if AI fails
+                validated_opportunities.append(opp)
+
+        # Add remaining opportunities without AI validation
+        remaining = opportunities[max_to_validate:]
+        if remaining:
+            print(f"\n   Keeping {len(remaining)} remaining opportunities without AI validation")
+            sys.stdout.flush()
+            validated_opportunities.extend(remaining)
+
+        # Re-sort by score after AI adjustments
+        validated_opportunities.sort(key=lambda x: x.get('score', 0), reverse=True)
+
+        print(f"\n   AI Validation complete: {len(validated_opportunities)} opportunities")
+        sys.stdout.flush()
+
+        return validated_opportunities
+
+    def display_position_details(self):
+        """
+        Display detailed information about current positions.
+        """
+        from .fetcher import StockFetcher
+        from .binance_fetcher import BinanceFetcher
+
+        fetcher = StockFetcher()
+        binance = BinanceFetcher()
+
+        print(f"\n{'='*90}")
+        print(f"📊  CURRENT POSITIONS ANALYSIS")
+        print(f"{'='*90}")
+        print(f"{'Symbol':<12} {'Qty':<10} {'Buy Price':<12} {'Current':<12} {'P&L':<10} {'P&L%':<8} {'Hold Time':<15} {'Value':<12}")
+        print(f"{'-'*90}")
+
+        total_position_value = 0.0
+        current_time = time.time()
+        api_urls = []  # Collect URLs for reference section
+
+        for symbol in self.portfolio.holdings.keys():
+            try:
+                quantity = self.portfolio.holdings[symbol]
+                avg_buy = self.portfolio.avg_buy_price[symbol]
+
+                # Get current price
+                is_crypto = "-USD" in symbol
+                if is_crypto:
+                    binance_symbol = binance.convert_symbol(symbol)
+                    binance_data = binance.get_crypto_price(binance_symbol)
+                    if not binance_data:
+                        continue
+                    current_price = binance_data["current_price"]
+                    # Collect URL instead of printing immediately
+                    api_urls.append(f"   {symbol:<12} https://api.binance.com/api/v3/ticker/24hr?symbol={binance_symbol}")
+                else:
+                    data = fetcher.get_stock_info(symbol)
+                    current_price = data.get("current_price")
+
+                profit_pct = unrealized_profit_pct(current_price, avg_buy)
+                if profit_pct is None:
+                    continue
+
+                # Calculate metrics
+                position_value = quantity * float(current_price)
+                total_position_value += position_value
+                profit_loss = position_value - (quantity * float(avg_buy))
+
+                # Hold time — refuse bool/gap stamps (True→1.0 invents ~1970 age)
+                entry_ts = coerce_unix_ts(self.position_entry_times.get(symbol))
+                if entry_ts is not None:
+                    hold_seconds = current_time - entry_ts
+                    if hold_seconds < 3600:
+                        hold_time = f"{int(hold_seconds/60)}m"
+                    else:
+                        hold_time = f"{hold_seconds/3600:.1f}h"
+                else:
+                    hold_time = "unknown"
+
+                # Format output
+                emoji = "🟢" if profit_pct >= 0 else "🔴"
+                print(f"{emoji} {symbol:<10} {quantity:<10.2f} €{avg_buy:<11.2f} €{current_price:<11.2f} "
+                      f"€{profit_loss:>8.2f} {profit_pct:>7.2f}% {hold_time:<15} €{position_value:>10.2f}")
+
+            except Exception as e:
+                print(f"⚠️  {symbol:<10} Error: {safe_exc_text(e, limit=40)}")
+
+        print(f"{'-'*90}")
+        print(f"{'TOTAL POSITIONS VALUE:':<75} €{total_position_value:>12,.2f}")
+        print(f"{'CASH:':<75} €{self.portfolio.cash:>12,.2f}")
+        print(f"{'PORTFOLIO TOTAL:':<75} €{total_position_value + self.portfolio.cash:>12,.2f}")
+        print(f"{'='*90}")
+
+        # API Reference section
+        if api_urls:
+            print(f"\n📡 API Calls:")
+            for url in api_urls:
+                print(url)
+        print()
+
+    def check_existing_positions(self):
+        """
+        Monitor existing positions for profit-taking, stop-loss, and overweight trim.
+        """
+        from .fetcher import StockFetcher
+        from .binance_fetcher import BinanceFetcher
+
+        fetcher = StockFetcher()
+        binance = BinanceFetcher()
+
+        holdings = list(self.portfolio.holdings.keys())
+        marks: List[Dict] = []
+        now = time.time()
+
+        for symbol in holdings:
+            try:
+                # Get current price
+                is_crypto = "-USD" in symbol
+                if is_crypto:
+                    binance_symbol = binance.convert_symbol(symbol)
+                    binance_data = binance.get_crypto_price(binance_symbol)
+                    if not binance_data:
+                        continue
+                    price = binance_data["current_price"]
+                else:
+                    data = fetcher.get_stock_info(symbol)
+                    price = data.get("current_price")
+
+                # Check profit-taking and stop-loss
+                avg_buy = self.portfolio.avg_buy_price[symbol]
+                profit_pct = unrealized_profit_pct(price, avg_buy)
+                if profit_pct is None:
+                    print(
+                        f"   ⏸️  Skipping {symbol}: invalid mark/cost "
+                        f"(unavailable — refuse TP/SL on bad price)"
+                    )
+                    continue
+                price = float(price)
+                entry_ts = coerce_unix_ts(self.position_entry_times.get(symbol))
+                # unknown/invalid entry → enforce min-hold (do not treat as aged-in;
+                # True→1.0 must not invent ~1970 past-min-hold unlock)
+                hold_seconds = (now - entry_ts) if entry_ts is not None else 0.0
+                marks.append(
+                    {
+                        "symbol": symbol,
+                        "price": price,
+                        "profit_pct": profit_pct,
+                        "hold_seconds": hold_seconds,
+                        "is_crypto": is_crypto,
+                    }
+                )
+
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+                # RSI note for crypto (informational; exits use crypto ±10% bands)
+                if is_crypto and profit_pct > 5.0:
+                    tech_indicators = binance.get_technical_indicators(binance_symbol)
+                    if tech_indicators and 'rsi' in tech_indicators:
+                        rsi = tech_indicators['rsi']
+                        if rsi > 70:
+                            print(f"   📊 {symbol}: RSI high ({rsi:.1f}) with profit {profit_pct:.2f}% - consider early profit-taking")
+
+                tp_thr, sl_thr = exit_thresholds_for_asset(is_crypto=is_crypto)
+
+                # PROFIT TAKING (clears Revolut-like round-trip + cushion)
+                if should_take_profit(profit_pct, threshold=tp_thr):
+                    quantity = self.portfolio.holdings[symbol]
+                    result = self._sell_position(
+                        symbol,
+                        price,
+                        quantity,
+                        timestamp,
+                        exit_reason="tp",
+                        profit_pct=profit_pct,
+                        threshold=tp_thr,
+                    )
+                    if result["success"]:
+                        print(
+                            f"   💰 {symbol}: Profit target hit (+{profit_pct:.2f}% "
+                            f"/ thr {tp_thr:g}%) - SOLD €{result['transaction']['profit_loss']:+,.2f}"
+                        )
+                        self._record_exit(symbol)
+
+                # STOP LOSS — hard risk cut only (not for scan rotation)
+                elif should_stop_loss(profit_pct, threshold=sl_thr):
+                    quantity = self.portfolio.holdings[symbol]
+                    result = self._sell_position(
+                        symbol,
+                        price,
+                        quantity,
+                        timestamp,
+                        exit_reason="sl",
+                        profit_pct=profit_pct,
+                        threshold=sl_thr,
+                    )
+                    if result["success"]:
+                        self._arm_post_stop_cooldown()
+                        print(
+                            f"   🛑 {symbol}: Stop loss triggered ({profit_pct:.2f}% "
+                            f"/ thr −{sl_thr:g}%) - SOLD €{result['transaction']['profit_loss']:+,.2f}"
+                        )
+                        print(
+                            f"   ⏸️  Post-SL buy cooldown "
+                            f"{self._post_stop_cooldown_seconds():.0f}s armed"
+                        )
+                        self._record_exit(symbol)
+
+            except Exception as e:
+                print(f"   ⚠️ Error checking {symbol}: {safe_exc_text(e, limit=120)}")
+                # DNS/provider blips are expected; dumping chained Tracebacks wakes the watchdog
+                if not is_transient_network_error(e):
+                    print(f"   Traceback: {redact_secrets(traceback.format_exc())}")
+
+        # Overweight trim: sell past-min-hold names (worst first) until at_cap.
+        # Cap loops so a bad mark list cannot spin forever.
+        trim_budget = max(1, int(self.max_positions) + 5)
+        while (
+            book_action_mode(len(self.portfolio.holdings), self.max_positions)
+            == "overweight"
+            and trim_budget > 0
+        ):
+            trim_budget -= 1
+            still = [m for m in marks if m["symbol"] in self.portfolio.holdings]
+            pick, why = pick_overweight_trim_candidate(
+                still, min_hold_seconds=float(self.min_hold_time)
+            )
+            if not pick:
+                print(f"   ✂️  Overweight trim paused: {why}")
+                break
+            row = next(m for m in still if m["symbol"] == pick)
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            quantity = self.portfolio.holdings[pick]
+            from .exit_policy import _coerce_profit_pct
+
+            trim_pct = _coerce_profit_pct(row.get("profit_pct"))
+            result = self._sell_position(
+                pick,
+                float(row["price"]),
+                quantity,
+                timestamp,
+                exit_reason="trim",
+                profit_pct=trim_pct,
+                detail=why,
+            )
+            if not result["success"]:
+                print(f"   ✂️  Trim sell failed for {pick}")
+                break
+            print(
+                f"   ✂️  {pick}: {why} — SOLD "
+                f"€{result['transaction']['profit_loss']:+,.2f} "
+                f"(book {len(self.portfolio.holdings)}/{self.max_positions})"
+            )
+            self._record_exit(pick)
+        self._refresh_paper_calm()
+
+    def execute_new_trades(self):
+        """
+        Execute trades for validated opportunities.
+
+        Weekends: crypto only (24/7). US stocks stay paused.
+        """
+        from .fetcher import StockFetcher
+        from .binance_fetcher import BinanceFetcher
+
+        fetcher = StockFetcher()
+        binance = BinanceFetcher()
+
+        is_weekend = self.scanner.is_weekend()
+        if is_weekend:
+            print(f"   📅 Weekend: crypto-only trading (stocks paused)")
+
+        from .technical_indicators import coerce_nonneg_int
+
+        # tradermonty #700/#655: refuse bool — True→1 invents crypto/stock interleave.
+        raw_c = coerce_nonneg_int(self.top_crypto_count)
+        raw_pos = coerce_nonneg_int(self.max_positions)
+        max_c = max(1, 1 if raw_c is None else raw_c)
+        pos = _DEFAULT_MAX_POSITIONS if raw_pos is None else raw_pos
+        max_s = max(1, pos - max_c + 1)
+        sorted_opportunities = order_entry_candidates(
+            list(self.current_opportunities),
+            max_crypto=max_c,
+            max_stock=max_s,
+        )
+
+        trades_executed = 0
+
+        if self._entries_blocked_this_cycle():
+            return
+
+        for opportunity in sorted_opportunities:
+            # Check if we still have room for more positions
+            if len(self.portfolio.holdings) >= self.max_positions:
+                print(f"   📊 Max positions reached ({self.max_positions}), stopping new trades")
+                break
+
+            symbol = opportunity.get("symbol")
+
+            # Skip if we already hold this position
+            if symbol in self.portfolio.holdings:
+                continue
+
+            if not is_tradeable_symbol(str(symbol)):
+                print(f"   ⏸️  Skipping {symbol}: filtered (stable/leveraged/noise)")
+                continue
+
+            crypto_block = crypto_buy_block_reason(str(symbol))
+            if crypto_block:
+                print(f"   ⏸️  Skipping {symbol}: {crypto_block}")
+                continue
+
+            if is_crypto_symbol(str(symbol)):
+                slot_ok, slot_why = crypto_slot_available(
+                    self.portfolio.holdings.keys(),
+                    max_crypto=self.max_crypto_positions,
+                )
+                if not slot_ok:
+                    print(f"   ⏸️  Skipping {symbol}: {slot_why}")
+                    continue
+
+            rebuy_ok, rebuy_why = self._rebuy_allowed(str(symbol))
+            if not rebuy_ok:
+                print(f"   ⏸️  Skipping {symbol}: {rebuy_why} (anti flip-flop)")
+                continue
+
+            blocked, why = is_in_earnings_blackout(str(symbol))
+            if blocked:
+                print(f"   ⏸️  Skipping {symbol}: earnings blackout ({why})")
+                continue
+            if why:
+                log_soft_allow("earnings", f"{symbol}: {why}")
+
+            try:
+                # Get current price
+                is_crypto = "-USD" in symbol
+
+                if is_weekend and not is_crypto:
+                    continue
+
+                # Per-symbol hours: US cash vs Xetra (.DE); crypto 24/7
+                if not is_crypto and is_equity_session_closed(str(symbol)):
+                    print(
+                        f"   ⏸️  Skipping {symbol}: session closed "
+                        f"(US RTH or Xetra hours)"
+                    )
+                    continue
+
+                gates_ok, gates_why = self._soft_gates_ok(
+                    str(symbol), is_crypto, fetcher=fetcher, binance=binance
+                )
+                if not gates_ok:
+                    print(f"   ⏸️  Skipping {symbol}: {gates_why}")
+                    continue
+
+                if is_crypto:
+                    binance_symbol = binance.convert_symbol(symbol)
+                    binance_data = binance.get_crypto_price(binance_symbol)
+                    if not binance_data:
+                        print(f"   ⚠️ Could not fetch price for {symbol}")
+                        continue
+                    current_price = binance_data["current_price"]
+                    if not mark_price_ok(current_price):
+                        print(
+                            f"   ⏸️  Skipping {symbol}: invalid crypto mark "
+                            f"(unavailable)"
+                        )
+                        continue
+                    if not crypto_entry_price_ok(current_price):
+                        print(
+                            f"   ⏸️  Skipping {symbol}: crypto price ${float(current_price):.4f} "
+                            f"below $1 floor (meme/churn filter)"
+                        )
+                        continue
+                    
+                    # Check RSI for crypto - skip if overbought
+                    tech_indicators = binance.get_technical_indicators(binance_symbol)
+                    if tech_indicators and 'rsi' in tech_indicators:
+                        rsi = tech_indicators['rsi']
+                        if rsi > 75:
+                            print(f"   ⏸️  Skipping {symbol}: RSI too high ({rsi:.1f} > 75) - overbought condition")
+                            continue
+                else:
+                    data = fetcher.get_stock_info(symbol)
+                    current_price = data.get("current_price")
+                    if not mark_price_ok(current_price):
+                        print(f"   ⚠️ Could not fetch usable price for {symbol}")
+                        continue
+
+                current_price = float(current_price)
+
+                allowed, guard_why, size_mult = self._scan_entry_allowed(opportunity)
+                if not allowed:
+                    print(f"   ⏸️  Skipping {symbol}: {guard_why}")
+                    continue
+                if size_mult < 0.999:
+                    print(
+                        f"   📐 {symbol}: position size ×{size_mult:.2f} "
+                        f"(tight implied stop)"
+                    )
+
+                # Calculate investment amount (position_size % of portfolio)
+                investment_amount = (
+                    self.portfolio.cash * self.position_size * size_mult
+                )
+
+                # Calculate shares to buy
+                shares = investment_amount / current_price
+
+                # Ensure we have enough cash
+                total_cost = shares * current_price
+                if total_cost > self.portfolio.cash:
+                    print(f"   ⚠️ Insufficient cash for {symbol} (need €{total_cost:,.2f}, have €{self.portfolio.cash:,.2f})")
+                    continue
+
+                conc_ok, conc_why = self._concentration_ok(notional=total_cost)
+                if not conc_ok:
+                    print(f"   ⏸️  Skipping {symbol}: {conc_why}")
+                    continue
+
+                # Execute the buy order
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                result = self.portfolio.buy(
+                    symbol,
+                    current_price,
+                    shares,
+                    timestamp,
+                    context=buy_note_from_opportunity(opportunity, source="scan"),
+                )
+
+                if result["success"]:
+                    trades_executed += 1
+                    action = opportunity.get("action", "BUY")
+                    confidence = opportunity.get("ai_confidence") or opportunity.get(
+                        "confidence", "UNKNOWN"
+                    )
+                    score = opportunity.get("score", 0)
+                    ctx = buy_note_from_opportunity(opportunity, source="scan")
+                    reason = ctx.get("note") or "No reason recorded"
+
+                    print(f"   ✅ EXECUTED: {symbol}")
+                    print(f"      Action: {action} | Confidence: {confidence} | Score: {score:+.0f}")
+                    print(f"      Price: €{current_price:.2f} | Shares: {shares:.4f} | Cost: €{total_cost:,.2f}")
+                    print(f"      Reason: {reason}")
+
+                    # Record entry time and persist
+                    self.position_entry_times[symbol] = time.time()
+                    self.persistence.save_entry_times(self.position_entry_times)
+                else:
+                    print(f"   ❌ Trade failed for {symbol}: {result.get('message', 'Unknown error')}")
+
+            except Exception as e:
+                print(f"   ⚠️ Error executing trade for {symbol}: {safe_exc_text(e, limit=100)}")
+                if not is_transient_network_error(e):
+                    print(f"   Traceback: {redact_secrets(traceback.format_exc())}")
+
+        if trades_executed > 0:
+            print(f"\n💼 Executed {trades_executed} new trade(s)")
+        else:
+            print(f"\n💼 No new trades executed")
+
+    def evaluate_rebalancing(self) -> bool:
+        """
+        Evaluate if portfolio should be rebalanced based on new opportunities.
+
+        Weekends: crypto only (24/7). US stocks stay paused.
+
+        Returns True if rebalancing occurred.
+        """
+        from .fetcher import StockFetcher
+        from .binance_fetcher import BinanceFetcher
+        from .recommender import RecommendationEngine
+
+        if not self.current_opportunities:
+            return False
+
+        # Overweight books must shrink via TP/SL only — never rotate/buy here.
+        if book_action_mode(len(self.portfolio.holdings), self.max_positions) == "overweight":
+            print(
+                f"   ⏸️  Rebalance skipped: overweight "
+                f"({len(self.portfolio.holdings)}/{self.max_positions})"
+            )
+            return False
+
+        is_weekend = self.scanner.is_weekend()
+        if is_weekend:
+            print(f"   📅 Weekend: crypto-only rebalancing (stocks paused)")
+
+        fetcher = StockFetcher()
+        binance = BinanceFetcher()
+        recommender = RecommendationEngine()
+
+        # Get current holdings
+        current_holdings = set(self.portfolio.holdings.keys())
+
+        # Get top N opportunities (where N = max_positions)
+        top_opportunities = [
+            opp
+            for opp in self.current_opportunities
+            if (not is_weekend) or ("-USD" in str(opp.get("symbol", "")))
+        ][: self.max_positions]
+        top_symbols = {opp['symbol'] for opp in top_opportunities}
+        # Keep if still anywhere on the scan list — ranking noise must not
+        # trigger sell→rebuy of the same name a few minutes later (SCHW).
+        still_interesting = opportunity_symbol_set(self.current_opportunities)
+
+        # Check if we have capital to add new positions
+        portfolio_value = self.portfolio.get_total_value()
+        available_pct = self.portfolio.cash / portfolio_value
+
+        # Identify symbols we should hold but don't
+        missing_opportunities = top_symbols - current_holdings
+
+        # Only rotate names that fell off the *entire* opportunity list
+        stale_holdings = current_holdings - still_interesting
+
+        rebalanced = False
+
+        # Do not sell winners unless we have somewhere better to put the cash.
+        if stale_holdings and not missing_opportunities:
+            for symbol in list(stale_holdings):
+                print(f"   💎 {symbol}: Keep (no stronger replacement in top {self.max_positions})")
+            stale_holdings = set()
+
+        # Sell stale holdings only if they are *winners* worth rotating.
+        # Never crystallize a loss just because the scanner found a shinier name.
+        for symbol in stale_holdings:
+            try:
+                entry_ts = coerce_unix_ts(self.position_entry_times.get(symbol))
+                hold_time = (time.time() - entry_ts) if entry_ts is not None else 0.0
+
+                # Get current price
+                is_crypto = "-USD" in symbol
+
+                if is_weekend and not is_crypto:
+                    continue
+
+                if not is_crypto and is_equity_session_closed(str(symbol)):
+                    print(
+                        f"   ⏸️  Skipping {symbol}: session closed "
+                        f"(US RTH or Xetra hours)"
+                    )
+                    continue
+                
+                if is_crypto:
+                    binance_symbol = binance.convert_symbol(symbol)
+                    binance_data = binance.get_crypto_price(binance_symbol)
+                    if not binance_data:
+                        continue
+                    price = binance_data["current_price"]
+                else:
+                    data = fetcher.get_stock_info(symbol)
+                    price = data.get("current_price")
+
+                # Check P&L before selling — refuse bool/gap marks (True→1.0)
+                avg_buy = self.portfolio.avg_buy_price[symbol]
+                profit_pct = unrealized_profit_pct(price, avg_buy)
+                if profit_pct is None:
+                    print(
+                        f"   ⏸️  Skipping {symbol}: invalid mark/cost "
+                        f"(unavailable — refuse rotate on bad price)"
+                    )
+                    continue
+                price = float(price)
+
+                sell_ok, why = should_rebalance_exit(
+                    profit_pct=profit_pct,
+                    hold_seconds=hold_time,
+                    min_hold_seconds=float(self.min_hold_time),
+                )
+                if not sell_ok:
+                    print(f"   💎 {symbol}: Keep ({why}, {profit_pct:+.2f}%)")
+                    continue
+
+                # Sell the position
+                quantity = self.portfolio.holdings[symbol]
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                result = self._sell_position(
+                    symbol,
+                    price,
+                    quantity,
+                    timestamp,
+                    exit_reason="rotation",
+                    profit_pct=profit_pct,
+                    detail=why,
+                )
+
+                if result["success"]:
+                    tx = result["transaction"]
+                    note = tx.get("note") or why
+                    print(
+                        f"   📤 {symbol}: Exited stale winner - "
+                        f"€{tx['profit_loss']:+,.2f} ({profit_pct:+.2f}%) · {note}"
+                    )
+                    self._record_exit(symbol)
+                    rebalanced = True
+
+            except Exception as e:
+                print(f"   ⚠️ Error selling {symbol}: {safe_exc_text(e, limit=50)}")
+
+        # Buy missing opportunities if we have cash and room under max_positions
+        if available_pct >= self.position_size and not self._entries_blocked_this_cycle():
+            for opp in top_opportunities:
+                symbol = opp['symbol']
+
+                if len(self.portfolio.holdings) >= self.max_positions:
+                    print(
+                        f"   📊 Max positions reached ({self.max_positions}), "
+                        f"stopping rebalance buys"
+                    )
+                    break
+
+                if symbol in self.portfolio.holdings:
+                    continue
+
+                if symbol not in missing_opportunities:
+                    continue
+
+                crypto_block = crypto_buy_block_reason(str(symbol))
+                if crypto_block:
+                    print(f"   ⏸️  Skipping {symbol}: {crypto_block}")
+                    continue
+
+                if is_crypto_symbol(str(symbol)):
+                    slot_ok, slot_why = crypto_slot_available(
+                        self.portfolio.holdings.keys(),
+                        max_crypto=self.max_crypto_positions,
+                    )
+                    if not slot_ok:
+                        print(f"   ⏸️  Skipping {symbol}: {slot_why}")
+                        continue
+
+                rebuy_ok, rebuy_why = self._rebuy_allowed(str(symbol))
+                if not rebuy_ok:
+                    print(f"   ⏸️  Skipping {symbol}: {rebuy_why} (anti flip-flop)")
+                    continue
+
+                try:
+                    # Get current price and data
+                    is_crypto = "-USD" in symbol
+
+                    if is_weekend and not is_crypto:
+                        continue
+
+                    if not is_crypto and is_equity_session_closed(str(symbol)):
+                        print(
+                            f"   ⏸️  Skipping {symbol}: session closed "
+                            f"(US RTH or Xetra hours)"
+                        )
+                        continue
+
+                    if not is_crypto:
+                        blocked, why = is_in_earnings_blackout(str(symbol))
+                        if blocked:
+                            print(f"   ⏸️  Skipping {symbol}: earnings blackout ({why})")
+                            continue
+                        if why:
+                            log_soft_allow("earnings", f"{symbol}: {why}")
+
+                    gates_ok, gates_why = self._soft_gates_ok(
+                        str(symbol), is_crypto, fetcher=fetcher, binance=binance
+                    )
+                    if not gates_ok:
+                        print(f"   ⏸️  Skipping {symbol}: {gates_why}")
+                        continue
+                    
+                    if is_crypto:
+                        binance_symbol = binance.convert_symbol(symbol)
+                        binance_data = binance.get_crypto_price(binance_symbol)
+                        if not binance_data:
+                            continue
+                        price = binance_data["current_price"]
+                        if not mark_price_ok(price):
+                            print(
+                                f"   ⏸️  Skipping {symbol}: invalid crypto mark "
+                                f"(unavailable)"
+                            )
+                            continue
+                        if not crypto_entry_price_ok(price):
+                            print(
+                                f"   ⏸️  Skipping {symbol}: crypto price ${float(price):.4f} "
+                                f"below $1 floor (meme/churn filter)"
+                            )
+                            continue
+                        price = float(price)
+                        data = {
+                            "symbol": symbol,
+                            "current_price": price,
+                            "previous_close": price / (1 + binance_data["change_24h"]/100),
+                            "52_week_high": binance_data["high_24h"],
+                            "52_week_low": binance_data["low_24h"],
+                            "source": "binance"
+                        }
+                    else:
+                        data = fetcher.get_stock_info(symbol) or {}
+                        price = data.get("current_price")
+                        if not mark_price_ok(price):
+                            continue
+                        price = float(price)
+                        data = {**data, "current_price": price}
+
+                    allowed, guard_why, size_mult = self._scan_entry_allowed(opp)
+                    if not allowed:
+                        print(f"   ⏸️  Skipping {symbol}: {guard_why}")
+                        continue
+                    if size_mult < 0.999:
+                        print(
+                            f"   📐 {symbol}: position size ×{size_mult:.2f} "
+                            f"(tight implied stop)"
+                        )
+
+                    # Get recommendation to validate buy
+                    recommendation = recommender.analyze_stock_recommendation(data)
+
+                    if recommendation["action"] == "BUY":
+                        # Calculate position size
+                        portfolio_value = self.portfolio.get_total_value()
+                        max_investment = (
+                            portfolio_value * self.position_size * size_mult
+                        )
+                        quantity = max_investment / price
+
+                        # Round quantity
+                        if price > 100:
+                            quantity = round(quantity, 2)
+                        else:
+                            quantity = round(quantity, 4)
+
+                        notional = quantity * price
+                        conc_ok, conc_why = self._concentration_ok(notional=notional)
+                        if not conc_ok:
+                            print(f"   ⏸️  Skipping {symbol}: {conc_why}")
+                            continue
+
+                        # Execute buy
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        if quantity > 0 and self.portfolio.can_buy(symbol, price, quantity):
+                            result = self.portfolio.buy(
+                                symbol,
+                                price,
+                                quantity,
+                                timestamp,
+                                context=buy_note_from_opportunity(
+                                    opp,
+                                    source="rebalance",
+                                    recommendation=recommendation,
+                                ),
+                            )
+
+                            if result["success"]:
+                                print(f"   📥 {symbol}: Added new opportunity ({opp['strategy']}) - €{result['transaction']['total_cost']:,.2f}")
+                                # Track entry time and persist
+                                self.position_entry_times[symbol] = time.time()
+                                self.persistence.save_entry_times(self.position_entry_times)
+                                rebalanced = True
+
+                                # Update available cash
+                                portfolio_value = self.portfolio.get_total_value()
+                                available_pct = self.portfolio.cash / portfolio_value
+
+                                if available_pct < self.position_size:
+                                    break
+
+                except Exception as e:
+                    print(f"   ⚠️ Error buying {symbol}: {safe_exc_text(e, limit=50)}")
+
+        return rebalanced
+
+    def apply_runtime_config(self) -> None:
+        """
+        Hot-reload Ops knobs from data/trader_config.json (env fallback).
+
+        AI mode/model, regime gate, and RS gate can change without recreating the container.
+        """
+        from .trader_config import load_trader_config
+        import os
+
+        cfg = load_trader_config(self.persistence.data_dir)
+        new_mode = str(cfg.get("ai_mode") or "off")
+        new_model = str(cfg.get("ai_model") or "gemma4:latest")
+        multi = bool(cfg.get("ai_multi_role", True))
+        regime = bool(cfg.get("regime_gate", True))
+        rs_gate = bool(cfg.get("rs_gate", True))
+        breadth_gate = bool(cfg.get("breadth_gate", True))
+        from .technical_indicators import _finite_signed
+
+        fee_preset = str(cfg.get("fee_preset") or DEFAULT_FEE_PRESET)
+        preset_rate, preset_min = rates_for_preset(fee_preset)
+        raw_fee_rate = cfg.get("commission_rate")
+        raw_fee_min = cfg.get("commission_min_eur")
+        # tradermonty #700/#655: refuse bool/`or` invent — True→100% fees;
+        # 0.0 rate is a real free schedule (do not `or` into preset).
+        fee_rate = (
+            float(raw_fee_rate)  # type: ignore[arg-type]
+            if _finite_signed(raw_fee_rate)
+            else float(preset_rate)
+        )
+        fee_min = (
+            float(raw_fee_min)  # type: ignore[arg-type]
+            if _finite_signed(raw_fee_min)
+            else float(preset_min)
+        )
+
+        os.environ["AI_MULTI_ROLE"] = "1" if multi else "0"
+        os.environ["REGIME_GATE"] = "1" if regime else "0"
+        os.environ["RS_GATE"] = "1" if rs_gate else "0"
+        os.environ["BREADTH_GATE"] = "1" if breadth_gate else "0"
+        self._regime_enabled = regime
+        self._rs_enabled = rs_gate
+        self._rs_lookback = rs_lookback()
+        self._breadth_enabled = breadth_gate
+
+        fee_changed = (
+            abs(float(self.portfolio.commission_rate) - fee_rate) > 1e-12
+            or abs(float(getattr(self.portfolio, "commission_min_eur", 0.0)) - fee_min)
+            > 1e-12
+            or str(getattr(self.portfolio, "fee_preset", "")) != fee_preset
+        )
+        if fee_changed:
+            self.portfolio.apply_fee_preset(fee_preset, persist=True)
+            free = free_legs_for_preset(fee_preset)
+            print(
+                f"   💶 Fee schedule: {fee_preset} · "
+                f"{fee_rate*100:.2f}%/side · min €{fee_min:.2f} · "
+                f"{free} free leg(s)/mo"
+            )
+
+        raw_max = cfg.get("max_positions")
+        # bool is an int subclass — int(True)==1 must not invent a 1-slot book.
+        if isinstance(raw_max, bool) or raw_max is None:
+            new_max = self.max_positions
+        else:
+            try:
+                new_max = int(raw_max)
+            except (TypeError, ValueError):
+                new_max = self.max_positions
+        new_max = max(1, min(12, new_max))
+        raw_hold = cfg.get("min_hold_hours")
+        if _finite_signed(raw_hold):
+            new_hold_h = float(raw_hold)  # type: ignore[arg-type]
+        else:
+            new_hold_h = self.min_hold_time / 3600.0
+        new_hold_h = max(4.0, min(168.0, new_hold_h))
+        new_hold_s = int(new_hold_h * 3600)
+        size_changed = new_max != self.max_positions or new_hold_s != self.min_hold_time
+        if size_changed:
+            print(
+                f"   📦 Book limits: max_positions {self.max_positions}→{new_max} · "
+                f"min_hold {self.min_hold_time/3600:.0f}h→{new_hold_h:.0f}h"
+            )
+            self.max_positions = new_max
+            self.min_hold_time = new_hold_s
+
+        promote = bool(cfg.get("promote_experiment_strategy", False))
+        if promote != self.promote_experiment_strategy:
+            print(
+                f"   📐 Promote champion filter: "
+                f"{'on' if promote else 'off'} (was {'on' if self.promote_experiment_strategy else 'off'})"
+            )
+        self.promote_experiment_strategy = promote
+        self._refresh_paper_calm()
+
+        if new_mode == self.ai_mode and new_model == self.ai_model:
+            return
+
+        prev = f"{self.ai_mode}/{self.ai_model}"
+        self.ai_mode = new_mode
+        self.ai_model = new_model
+        if new_mode != "off":
+            from .ai_recommender import AIRecommender
+
+            self.ai_recommender = AIRecommender(model=new_model)
+        else:
+            self.ai_recommender = None
+        print(f"   ⚙️  Runtime config: AI {prev} → {new_mode}/{new_model} "
+              f"(multi-role={'on' if multi else 'off'}, "
+              f"regime={'on' if regime else 'off'}, "
+              f"rs={'on' if rs_gate else 'off'}, "
+              f"breadth={'on' if breadth_gate else 'off'})")
+
+    def run(self):
+        """
+        Main trading loop.
+        """
+        self.apply_runtime_config()
+
+        print(f"\n{'#'*70}")
+        print(f"🚀  INTELLIGENT TRADER STARTED")
+        print(f"{'#'*70}\n")
+
+        iteration = 0
+
+        while True:
+            iteration += 1
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            print(f"\n{'='*70}")
+            print(f"⏰  Iteration #{iteration} - {timestamp}")
+            print(f"{'='*70}")
+
+            result = run_one_cycle(self)
+            if result.scanned and self.current_opportunities:
+                print(f"\n🎯 Top 5 Opportunities:")
+                for i, opp in enumerate(self.current_opportunities[:5], 1):
+                    print(
+                        f"   {i}. {opp.get('symbol')} - "
+                        f"{opp.get('strategy')} - {opp.get('reasoning')}"
+                    )
+            if result.posture == "overweight":
+                print(
+                    f"\n⏸️  Book overweight ({len(self.portfolio.holdings)}/{self.max_positions}) — "
+                    f"exits only (TP/SL). No new buys or scan rotation until at/under cap."
+                )
+            elif result.posture == "at_cap":
+                print(
+                    f"\n📊 Book at cap ({len(self.portfolio.holdings)}/{self.max_positions}) — "
+                    f"no new entries; rotation only if exit_policy allows."
+                )
+            if result.ran_rebalance:
+                print(f"\n✅ Portfolio rebalance phase ran")
+
+            # Show portfolio status summary
+            portfolio_value = self.portfolio.get_total_value()
+            total_return = ((portfolio_value - self.portfolio.initial_cash) / self.portfolio.initial_cash) * 100
+
+            print(f"\n💰 Portfolio Summary:")
+            print(f"   Version: {__version__}")
+            print(f"   Cash: €{self.portfolio.cash:,.2f}")
+            print(f"   Holdings: {len(self.portfolio.holdings)} positions")
+            print(f"   Total Value: €{portfolio_value:,.2f}")
+            print(f"   Return: {total_return:+.2f}%")
+            print(f"   Total Fees Paid: €{self.portfolio.total_fees_paid:,.2f}")
+            print(f"   Total Trades: {len(self.portfolio.transactions)}")
+
+            # Sleep until next trade interval
+            print(f"\n💤 Sleeping for {self.trade_interval}s...")
+            time.sleep(self.trade_interval)
+
+
+def main():
+    import argparse
+    import os
+    from pathlib import Path
+
+    from .runtime_log import install_runtime_log
+
+    install_runtime_log("trader", data_dir=Path(os.getenv("DATA_DIR", "/data")))
+
+    parser = argparse.ArgumentParser(description="Intelligent trading with continuous market analysis")
+    parser.add_argument("--capital", type=float, default=10000.0, help="Initial capital")
+    parser.add_argument("--scan-interval", type=int, default=900, help="Market scan interval (seconds)")
+    parser.add_argument("--trade-interval", type=int, default=300, help="Trading check interval (seconds)")
+    parser.add_argument(
+        "--max-positions",
+        type=int,
+        default=_DEFAULT_MAX_POSITIONS,
+        help=f"Maximum positions (default {_DEFAULT_MAX_POSITIONS}, matches Ops)",
+    )
+    parser.add_argument("--position-size", type=float, default=0.10, help="Position size as % of portfolio")
+    parser.add_argument(
+        "--min-hold-time",
+        type=int,
+        default=_DEFAULT_MIN_HOLD_SECONDS,
+        help=f"Minimum hold time seconds (default {_DEFAULT_MIN_HOLD_SECONDS}, matches Ops hours)",
+    )
+    parser.add_argument("--ai-mode", type=str, default="off", choices=["off", "validate", "full"],
+                        help="AI analysis mode: off (rule-based only), validate (AI validates HIGH signals), full (AI-driven)")
+    parser.add_argument("--ai-model", type=str, default="gemma4:latest",
+                        help="Ollama instruct/general model (not coder models)")
+    parser.add_argument("--top-crypto-count", type=int, default=1, help="Max crypto names in entry interleave (live buys still BTC/ETH only)")
+
+    args = parser.parse_args()
+
+    trader = IntelligentTrader(
+        initial_cash=args.capital,
+        scan_interval=args.scan_interval,
+        trade_interval=args.trade_interval,
+        max_positions=args.max_positions,
+        position_size=args.position_size,
+        min_hold_time=args.min_hold_time,
+        ai_mode=args.ai_mode,
+        ai_model=args.ai_model,
+        top_crypto_count=args.top_crypto_count
+    )
+
+    trader.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,40 @@
+# Move the desk to amvara3 (2026-10-03)
+
+Review of `ssh amvara3`, then the first move of the paper desk.
+
+## Host
+
+- Name: `amvara3`. Ubuntu 24.04. CPU: x86_64, 20 cores. RAM: 62 GiB. Disk free: about 139 GiB.
+- Docker 28 and Compose v2 are installed. Cursor CLI is installed for root. Ollama is not installed.
+- Public HTTP and HTTPS go through the HAProxy container.
+- Live host names: `cometa.amvara.de`, `redmine.amvara.de`, `redminetest.amvara.de`.
+- TLS files are one certificate per name in `/home/amvara/projects/certs-ssl`. There is no wildcard certificate.
+- DNS for `amvara.de` is at Joker. The desk name is `stock.zeitfenster.de` (A record to this host).
+
+## What runs where
+
+- Code: `/home/amvara/projects/ai-stock-checker` (git clone).
+- Paper book: `data/` and `.env` copied from the Mac. They stay out of git.
+- Containers: `intelligent-trader` and `openbb-backend`.
+- Desk bind: `127.0.0.1:7779` only. Open it with an SSH tunnel:
+
+```bash
+ssh -L 7779:127.0.0.1:7779 amvara3
+```
+
+Then open `http://127.0.0.1:7779/desk`.
+
+- Local Ollama is not installed on amvara3. Use the amvara8 SSH tunnel (`./scripts/install_ollama_tunnel_amvara8.sh`) and keep `OLLAMA_HOST=http://host.docker.internal:11434`.
+- **2026-11-18:** Ops had flipped `ai_mode` to `validate` with no model path; dead Ollama HOLD-filtered every candidate and froze ~€100k cash. Fixed with fail-open + AI-off breakout guard, then wired amvara8 Ollama via tunnel. See `desk_idle_cash_2026-11-18.md` and `ollama_amvara8_tunnel_2026-11-18.md`.
+- The Mac loops are removed. The LaunchAgent plist is gone, and the Mac `intelligent-trader` and `openbb-backend` containers are removed. The mac-stats overnight harness stays.
+- **2026-10-04:** Linux keep-alive is the systemd timer `ai-stock-checker-overnight-loops` (`./scripts/install_overnight_keepalive.sh`). It brings loops back after reboot.
+
+## Certificate
+
+On 2026-10-03 certbot issued `stock.zeitfenster.de` (standalone HTTP-01, ECDSA). It expires on 2027-01-01. The combined PEM is `/home/amvara/projects/certs-ssl/stock.zeitfenster.de.pem`. The name is in the deploy hook, so the 03:00 renewal job keeps it.
+
+## Public site
+
+HAProxy sends `stock.zeitfenster.de` to `127.0.0.1:7779`. Open the desk at `https://stock.zeitfenster.de/desk`.
+
+The OpenBB widget routes use `OPENBB_BACKEND_API_KEY` when that value is set. The desk pages, including Ops save, do not use that key.

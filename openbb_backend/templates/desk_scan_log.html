@@ -1,0 +1,381 @@
+{% extends "base.html" %}
+{% from "macros.html" import breadth_glance, scan_freshness, soft_allow_glance, pretrade_glance, next_buy_glance, book_risk_glance, mark_coverage_glance, ledger_health_glance, entry_gates_glance, calm_streak_glance, promote_ab_glance, crypto_policy_glance, exit_policy_glance, earnings_blackout_glance, ai_mode_glance, ai_roles_glance, laya_glance, ai_debate_glance, ai_validate_scope_glance, session_glance, equity_hours_glance, breakout_guard_glance, loss_rotation_glance, stale_rotation_glance, book_posture_glance, junk_filter_glance, universe_discovery_glance, atr_display_glance, entry_slots_glance, promote_contract_glance, gate_roles_glance, gate_params_glance, book_limits_glance, rebuy_cooldown_glance, daily_loss_glance, concentration_glance, listed_fund_overlap_glance, post_sl_cooldown_glance, loop_cadence_glance, improve_tick_glance, fee_allowance_glance, fee_burn_glance, stuck_capital_glance, min_hold_lock_glance, postmortem_glance %}
+{% block content %}
+<header class="page-head">
+  <p class="eyebrow">Breadth</p>
+  <h1>Scan log · {{ day }}</h1>
+  <p class="lede">
+    Latest trader opportunity report for this UTC day.
+    These names feed the Recent days pulse counts.
+  </p>
+  {% if day_meta.bit %}
+  <p class="sysline{% if day_meta.tone == 'warn' %} v down{% endif %}" id="scan-log-day-meta-h">
+    {{ day_meta.bit }}
+  </p>
+  {% endif %}
+  {{ scan_freshness(snap) }}
+  <p class="sysline">
+    <a href="/desk/breadth">← Back to Breadth</a>
+    {% if archive_file %} · file {{ archive_file }}{% endif %}
+  </p>
+</header>
+
+{{ pretrade_glance(
+  snap,
+  "scan-log-pretrade-h",
+  "/desk",
+  "Overview →",
+  "Checklist beside the day archive — FAIL blocks buys; WARN is fee burn / cooldown."
+) }}
+
+{{ next_buy_glance(
+  snap,
+  "scan-log-size-h",
+  "/desk",
+  "Overview size →",
+  "Suggested next-buy € beside the day archive — display only; not a gate."
+) }}
+
+{{ soft_allow_glance(snap) }}
+
+{{ entry_gates_glance(
+  snap,
+  "scan-log-gates-h",
+  "/desk/ops#cfg-h",
+  "Ops knobs →",
+  "Soft entry filters beside the day archive — display only; flip on Ops."
+) }}
+
+{{ calm_streak_glance(
+  snap,
+  "scan-log-calm-h",
+  "/desk/ops#calm-h",
+  "Ops calm →",
+  "Promote compose-default unlock beside the day archive — calm ≠ edge; detail on Ops."
+) }}
+
+{{ promote_ab_glance(
+  snap,
+  "scan-log-promote-ab-h",
+  "/desk/ops#ops-promote",
+  "Ops promote →",
+  "Fee-adjusted A/B window beside the day archive — do not flip promote mid-window."
+) }}
+
+{{ book_posture_glance(
+  snap,
+  "scan-log-book-posture-h",
+  "/desk/book",
+  "Book →",
+  "Live open/at_cap/overweight vs max; overweight names next trim (winners first). Display only."
+) }}
+
+{{ book_risk_glance(
+  snap,
+  "scan-log-book-risk-h",
+  "/desk/book",
+  "Full book →",
+  "Slots and posture beside the day archive — overweight means exits-only."
+) }}
+
+{{ mark_coverage_glance(
+  snap,
+  "scan-log-marks-h",
+  "/desk/book",
+  "Book marks →",
+  "Live mark vs cost fallback beside the day archive. Incomplete coverage warns. Not a gate."
+) }}
+
+{{ ledger_health_glance(
+  snap,
+  "scan-log-ledger-h",
+  "/desk/book",
+  "Book ledger →",
+  "Ledger parse check beside the day archive. Bad lines are named. Good rows stay. Not a gate."
+) }}
+
+{# MonsterDeveloper simplicity: keep first viewport short; policy lines stay available. #}
+{% set policy_meta = snap.policy_honesty_meta|default('crypto · exits · AI · gates · fees') %}
+{% set policy_warn = snap.policy_honesty_warn|default(false) %}
+<details class="policy-honesty{% if policy_warn %} warn{% endif %}" id="policy-honesty"{% if policy_warn %} open{% endif %}>
+  <summary>Policy honesty <span class="meta">{{ policy_meta }}</span></summary>
+  <p class="sub">Display-only rules. Not new entry gates. Ops keeps the toggles.</p>
+
+{{ crypto_policy_glance(
+  snap,
+  "scan-log-crypto-h",
+  "/desk/screener#crypto-h",
+  "Screener crypto →",
+  "Live crypto slot beside the day archive — BTC/ETH only · one slot · ±10% exits. Not a gate."
+) }}
+
+{{ exit_policy_glance(
+  snap,
+  "scan-log-exit-h",
+  "/desk/book",
+  "Book →",
+  "Stock exit bands beside the day archive — TP +8% / SL −5% / rotate ≥+5%. Not ATR."
+) }}
+
+{{ earnings_blackout_glance(
+  snap,
+  "scan-log-earnings-h",
+  "/desk/screener",
+  "Screener →",
+  "Stock blackout 2d/1d; empty/bad Yahoo → allow (suspect); crypto exempt."
+) }}
+
+{{ ai_mode_glance(
+  snap,
+  "scan-log-ai-h",
+  "/desk/ops#ops-ai-mode",
+  "Ops AI →",
+  "AI path beside the day archive — off / validate / full + multi-role. Rules first."
+) }}
+
+{{ ai_roles_glance(
+  snap,
+  "scan-log-ai-roles-h",
+  "/desk/ideas",
+  "Ideas →",
+  "Multi-role beside the day archive — bull/bear/risk; disagreement or risk veto → HOLD."
+) }}
+
+{{ laya_glance(
+  snap,
+  "scan-log-laya-h",
+  "/desk/ops#ops-ai-mode",
+  "Ops AI →",
+  "Beside the day archive — last advisory vs scan clock; clash if they disagree. Fail-open; not a gate."
+) }}
+
+{{ ai_debate_glance(
+  snap,
+  "scanlog-ai-debate-h",
+  "/desk/ideas#debate-h",
+  "Ideas debates →",
+  "Beside scan-log — recent validate memory; display only."
+) }}
+
+{{ ai_validate_scope_glance(
+  snap,
+  "scan-log-ai-scope-h",
+  "/desk/ops#ops-ai-mode",
+  "Ops AI →",
+  "Top-N LLM scope beside the day archive — rest keep scanner score. Display only."
+) }}
+
+{{ session_glance(
+  snap,
+  "scan-log-session-h",
+  "/desk/screener",
+  "Screener →",
+  "UTC session beside the day archive — weekend is crypto-only. Display only."
+) }}
+
+{{ equity_hours_glance(
+  snap,
+  "scan-log-equity-hours-h",
+  "/desk/screener",
+  "Screener →",
+  "Live US vs Xetra beside the day archive — .DE is not US hours; crypto 24/7."
+) }}
+
+{{ breakout_guard_glance(
+  snap,
+  "scan-log-breakout-h",
+  "/desk/screener#brk-h",
+  "Breakouts →",
+  "Breakout entry guards beside the day archive — AI BUY · LOW blocked · pullback."
+) }}
+
+{{ loss_rotation_glance(
+  snap,
+  "scan-log-loss-rot-h",
+  "/desk/book",
+  "Book →",
+  "No loss-rotation beside the day archive — losers stay; rotate winners only."
+) }}
+
+{{ stale_rotation_glance(
+  snap,
+  "scan-log-stale-rot-h",
+  "/desk/book",
+  "Book →",
+  "Stale rotation beside the day archive — off full scan list + top-N replacement."
+) }}
+
+{{ junk_filter_glance(
+  snap,
+  "scan-log-junk-h",
+  "/desk/screener",
+  "Screener →",
+  "Junk/noise filters beside the day archive — stables/leveraged dropped; crypto ≥ $1."
+) }}
+
+{{ universe_discovery_glance(
+  snap,
+  "scan-log-universe-h",
+  "/desk/screener",
+  "Screener →",
+  "Universe discovery beside the day archive — Yahoo movers grow US+DE scan only; not auto-buy."
+) }}
+
+{{ atr_display_glance(
+  snap,
+  "scan-log-atr-h",
+  "/desk/screener",
+  "Screener →",
+  "ATR / R:R beside the day archive — Screener notes are display-only; live exits use TP/SL."
+) }}
+
+{{ entry_slots_glance(
+  snap,
+  "scanlog-entry-slots-h",
+  "/desk/screener",
+  "Screener →",
+  "Day drill-down — entry ranking uses score band + interleave. Display only."
+) }}
+
+{{ promote_contract_glance(
+  snap,
+  "scanlog-promote-contract-h",
+  "/desk/ops#ops-promote",
+  "Ops promote →",
+  "Day drill-down — promote entry contract honesty. Display only."
+) }}
+
+{{ gate_roles_glance(
+  snap,
+  "scanlog-gate-roles-h",
+  "/desk/ops#ops-regime",
+  "Ops gates →",
+  "Day drill-down — regime vs RS vs breadth roles; starve→RS off first."
+) }}
+
+{{ gate_params_glance(
+  snap,
+  "scanlog-gate-params-h",
+  "/desk/ops#ops-regime",
+  "Ops gates →",
+  "Day drill-down — SMA / RS lookback / scan A/D mins; fail-open. Display only."
+) }}
+
+{{ book_limits_glance(
+  snap,
+  "scan-log-book-limits-h",
+  "/desk/ops#ops-max-pos",
+  "Ops book →",
+  "Slots · min hold · fee preset beside the day archive — packaging ≠ edge. Not a gate."
+) }}
+
+{{ rebuy_cooldown_glance(
+  snap,
+  "scan-log-rebuy-h",
+  "/desk/ops#ops-min-hold",
+  "Ops hold →",
+  "Same-symbol rebuy lock beside the day archive — SCHW flip-flop honesty. Not a gate."
+) }}
+
+{{ daily_loss_glance(
+  snap,
+  "scan-log-day-loss-h",
+  "/desk#pretrade-h",
+  "Pre-trade →",
+  "UTC-day realized vs −2% halt beside the day archive — headroom before FAIL. Soft buy block only."
+) }}
+
+{{ concentration_glance(
+  snap,
+  "scan-log-conc-h",
+  "/desk/book",
+  "Book →",
+  "Largest name vs 30% entry cap beside the day archive — headroom before size blocks."
+) }}
+
+{{ listed_fund_overlap_glance(
+  snap,
+  "scan-log-fund-overlap-h",
+  "/desk/book",
+  "Book →",
+  "Same-theme ETF/ETC doubles (gold · silver · US equity) — name overlap ≠ single-name cap. Display only."
+) }}
+
+{{ post_sl_cooldown_glance(
+  snap,
+  "scan-log-post-sl-h",
+  "/desk#pretrade-h",
+  "Pre-trade →",
+  "After SL, ≥4h buy block on day drill-down — anti revenge refill."
+) }}
+
+{{ loop_cadence_glance(
+  snap,
+  "scan-log-loop-cadence-h",
+  "/desk/ops#ops-scan-trade",
+  "Ops cadence →",
+  "Scan vs trade sleep beside the day archive — floors ≥15m / ≥5m. Packaging ≠ edge."
+) }}
+
+{{ improve_tick_glance(
+  snap,
+  "scan_log-improve-tick-h",
+  "/desk/ops#logs-h",
+  "Ops logs →",
+  "Last Cursor improve tick vs hourly cadence — fresh ≤75m · aging ≤3h · else stale. Display only."
+) }}
+
+{{ fee_allowance_glance(
+  snap,
+  "scan-log-fee-allowance-h",
+  "/desk/ops#ops-fee-preset",
+  "Ops fees →",
+  "Free monthly legs beside the day archive — Revolut-like quota; crypto fees not modeled. Not a gate."
+) }}
+
+{{ fee_burn_glance(
+  snap,
+  "scan-log-fee-burn-h",
+  "/desk/ops#ops-fee-preset",
+  "Ops fees →",
+  "Fee drag vs start and realized P&L beside the day archive — high (≥2% or fees>P&L) before chasing adds. Not a gate."
+) }}
+
+{{ stuck_capital_glance(
+  snap,
+  "scan-log-stuck-h",
+  "/desk/book",
+  "Book →",
+  "Past min-hold underwater beside the day archive — capital trapped until TP/SL/trim."
+) }}
+
+{{ min_hold_lock_glance(
+  snap,
+  "scan-log-min-hold-lock-h",
+  "/desk/ops#ops-min-hold",
+  "Ops hold →",
+  "Lots still inside min-hold beside the day archive — cannot rotate/trim yet. Not a gate."
+) }}
+
+{{ postmortem_glance(
+  snap,
+  "scan-log-post-h",
+  "/desk/book#post-h",
+  "Book rounds →",
+  "Newest closed round beside the day archive — full thesis list on Book. Not a gate."
+) }}
+
+</details>
+
+{{ breadth_glance(
+  snap,
+  "scan-log-breadth-h",
+  "Scan breadth for this day",
+  "Scan-list A/D for this UTC day — same pulse as Breadth Recent days; display only."
+) }}
+
+<section class="block" aria-labelledby="scan-log-h">
+  <h2 id="scan-log-h">Report</h2>
+  <pre class="scan-log" tabindex="0">{{ body }}</pre>
+</section>
+{% endblock %}

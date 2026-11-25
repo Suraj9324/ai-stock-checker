@@ -1,0 +1,613 @@
+{% extends "base.html" %}
+{% from "macros.html" import breadth_glance, scan_freshness, soft_allow_glance, next_buy_glance, book_risk_glance, mark_coverage_glance, ledger_health_glance, entry_gates_glance, calm_streak_glance, promote_ab_glance, crypto_policy_glance, exit_policy_glance, earnings_blackout_glance, ai_mode_glance, ai_roles_glance, laya_glance, ai_debate_glance, ai_validate_scope_glance, session_glance, equity_hours_glance, breakout_guard_glance, loss_rotation_glance, stale_rotation_glance, book_posture_glance, junk_filter_glance, universe_discovery_glance, atr_display_glance, entry_slots_glance, promote_contract_glance, gate_roles_glance, gate_params_glance, book_limits_glance, rebuy_cooldown_glance, daily_loss_glance, concentration_glance, listed_fund_overlap_glance, post_sl_cooldown_glance, loop_cadence_glance, improve_tick_glance, fee_allowance_glance, fee_burn_glance, stuck_capital_glance, min_hold_lock_glance, postmortem_glance %}
+{% block content %}
+<header class="page-head">
+  <p class="eyebrow">Ops</p>
+  <h1>Runtime</h1>
+  <p class="lede">Watchdog, live logs from shared <code>data/</code>, and trader knobs — configure AI here; no secrets in the browser.</p>
+  {{ scan_freshness(snap) }}
+</header>
+
+{{ breadth_glance(
+  snap,
+  "ops-breadth-h",
+  "Scan breadth beside ops knobs",
+  "Scan-list A/D before you flip the breadth gate — display only; the gate still uses leaders on the scan list."
+) }}
+
+<section class="pretrade" aria-labelledby="ops-pretrade-h">
+  <h2 id="ops-pretrade-h" class="visually-hidden">Pre-trade</h2>
+  <p class="pretrade-line">
+    <span class="pretrade-level {{ snap.pretrade_level|lower }}">{{ snap.pretrade_level }}</span>
+    <span class="pretrade-sep" aria-hidden="true">·</span>
+    <span class="pretrade-notes">{{ snap.pretrade_notes|join("; ") }}</span>
+  </p>
+  <p class="sub">Buy-halt honesty before knobs (tradermonty) — size glance below; full block on Overview.</p>
+</section>
+
+{{ next_buy_glance(
+  snap,
+  "ops-size-h",
+  "/desk",
+  "Overview size →",
+  "Suggested next-buy € before flipping knobs — Overview keeps the full size block."
+) }}
+
+{{ soft_allow_glance(
+  snap,
+  heading_id="ops-soft-allow-glance-h",
+  link_href="#soft-h",
+  link_label="Memory below →",
+  sub="Fail-open count before you flip gates — full list under the form; not a hard block."
+) }}
+
+{{ entry_gates_glance(
+  snap,
+  "ops-gates-h",
+  "#cfg-h",
+  "Knobs below →",
+  "Current soft-gate posture before you flip toggles — display only."
+) }}
+
+{{ calm_streak_glance(
+  snap,
+  "ops-calm-glance-h",
+  "#calm-h",
+  "Facts below →",
+  "Promote compose-default unlock — calm ≠ edge; full streak facts below."
+) }}
+
+{{ promote_ab_glance(
+  snap,
+  "ops-promote-ab-h",
+  "#ops-promote",
+  "Promote toggle →",
+  "Window A/B trading-day progress before you flip promote — fee-adjusted verdict still required."
+) }}
+
+{{ book_posture_glance(
+  snap,
+  "ops-book-posture-h",
+  "/desk/book",
+  "Book →",
+  "Live posture before flipping max positions — overweight names next trim; blocks buys and scan rotation."
+) }}
+
+{{ book_risk_glance(
+  snap,
+  "ops-book-risk-h",
+  "/desk/book",
+  "Full book →",
+  "Slots and posture before flipping book limits — overweight means exits-only."
+) }}
+
+{{ mark_coverage_glance(
+  snap,
+  "ops-marks-h",
+  "/desk/book",
+  "Book marks →",
+  "Live mark vs cost fallback before you flip knobs. Incomplete coverage warns. Not a gate."
+) }}
+
+{{ ledger_health_glance(
+  snap,
+  "ops-ledger-h",
+  "/desk/book",
+  "Book ledger →",
+  "Ledger parse check before you flip knobs. Bad lines are named. Good rows stay. Not a gate."
+) }}
+
+{# MonsterDeveloper simplicity: keep first viewport short; policy lines stay available. #}
+{% set policy_meta = snap.policy_honesty_meta|default('crypto · exits · AI · gates · fees') %}
+{% set policy_warn = snap.policy_honesty_warn|default(false) %}
+<details class="policy-honesty{% if policy_warn %} warn{% endif %}" id="policy-honesty"{% if policy_warn %} open{% endif %}>
+  <summary>Policy honesty <span class="meta">{{ policy_meta }}</span></summary>
+  <p class="sub">Display-only rules. Not new entry gates. Ops keeps the toggles.</p>
+
+{{ crypto_policy_glance(
+  snap,
+  "ops-crypto-h",
+  "/desk/screener#crypto-h",
+  "Screener crypto →",
+  "Live crypto policy before chasing scan leaders — BTC/ETH · one slot · ±10% exits."
+) }}
+
+{{ exit_policy_glance(
+  snap,
+  "ops-exit-h",
+  "/desk/book",
+  "Book →",
+  "Stock exit bands before reading marks — TP +8% / SL −5% / rotate ≥+5%. Not ATR."
+) }}
+
+{{ earnings_blackout_glance(
+  snap,
+  "ops-earnings-h",
+  "/desk/screener",
+  "Screener →",
+  "Earnings 2d/1d; empty/bad Yahoo → allow (suspect); missing → allow. Not a silent waiver."
+) }}
+
+{{ ai_mode_glance(
+  snap,
+  "ops-ai-glance-h",
+  "#ops-ai-mode",
+  "AI knobs →",
+  "AI mode before you flip validate/full — multi-role debate is optional; rules still first."
+) }}
+
+{{ ai_roles_glance(
+  snap,
+  "ops-ai-roles-h",
+  "/desk/ideas",
+  "Ideas →",
+  "Role contract before flipping multi-role — bull/bear/risk; veto/disagreement → HOLD."
+) }}
+
+{{ laya_glance(
+  snap,
+  "ops-laya-h",
+  "#ops-ai-mode",
+  "AI knobs →",
+  "Optional LAYA/JEV typed advisory beside Ollama — fail-open; not a buy gate (docs/LAYA.md)."
+) }}
+
+{{ ai_debate_glance(
+  snap,
+  "ops-ai-debate-h",
+  "/desk/ideas#debate-h",
+  "Ideas debates →",
+  "Validate memory before flipping AI mode — BUY/HOLD/SELL + gated; Ideas keeps transcripts."
+) }}
+
+{{ ai_validate_scope_glance(
+  snap,
+  "ops-ai-scope-h",
+  "#ops-ai-mode",
+  "AI knobs →",
+  "Top-N scope before flipping validate/full — only the head of the list gets LLM."
+) }}
+
+{{ session_glance(
+  snap,
+  "ops-session-h",
+  "/desk/screener",
+  "Screener →",
+  "UTC session before reading stock lists — weekend crypto-only; stocks resume Monday."
+) }}
+
+{{ equity_hours_glance(
+  snap,
+  "ops-equity-hours-h",
+  "/desk/screener",
+  "Screener →",
+  "US vs Xetra cash hours before reading .DE names — crypto 24/7. Not a gate."
+) }}
+
+{{ breakout_guard_glance(
+  snap,
+  "ops-breakout-h",
+  "/desk/screener#brk-h",
+  "Breakouts →",
+  "Breakout entry guards before trusting scan names — AI BUY · LOW blocked · pullback band."
+) }}
+
+{{ loss_rotation_glance(
+  snap,
+  "ops-loss-rot-h",
+  "/desk/book",
+  "Book →",
+  "No loss-rotation before you chase scan adds — losers hold; overweight trims winners first."
+) }}
+
+{{ stale_rotation_glance(
+  snap,
+  "ops-stale-rot-h",
+  "/desk/book",
+  "Book →",
+  "Stale rotation before you trust scan churn — off full list · need replacement · winners only."
+) }}
+
+
+{{ junk_filter_glance(
+  snap,
+  "ops-junk-h",
+  "/desk/screener",
+  "Screener →",
+  "Junk filters before you trust scan lists — stables/leveraged/noise out; crypto ≥ $1."
+) }}
+
+{{ universe_discovery_glance(
+  snap,
+  "ops-universe-h",
+  "/desk/screener",
+  "Screener →",
+  "Yahoo movers only grow the scan list — not a buy firehose; gates still apply."
+) }}
+
+{{ atr_display_glance(
+  snap,
+  "ops-atr-h",
+  "/desk/screener",
+  "Screener →",
+  "ATR / R:R on Screener is research framing only — live stock exits stay TP/SL (not ATR)."
+) }}
+
+{{ entry_slots_glance(
+  snap,
+  "ops-entry-slots-h",
+  "/desk/screener",
+  "Screener →",
+  "Ranking honesty before gate flips — score band + interleave; not a new gate."
+) }}
+
+{{ promote_contract_glance(
+  snap,
+  "ops-promote-contract-h",
+  "#ops-promote",
+  "Toggle →",
+  "Contract before you flip promote — entry veto only; champion SELL never buys."
+) }}
+
+{{ gate_roles_glance(
+  snap,
+  "ops-gate-roles-h",
+  "#ops-regime",
+  "Gates →",
+  "Role map before you flip soft gates — abs vs rel vs scan A/D; starve → RS off first."
+) }}
+
+{{ gate_params_glance(
+  snap,
+  "ops-gate-params-h",
+  "#ops-regime",
+  "Gates →",
+  "Thresholds before you flip soft gates — SMA / RS lookback / scan A/D mins; fail-open."
+) }}
+
+{{ book_limits_glance(
+  snap,
+  "ops-book-limits-h",
+  "#ops-max-pos",
+  "Book knobs →",
+  "Slots · min hold · fee preset before you flip Ops knobs — packaging ≠ edge."
+) }}
+
+{{ rebuy_cooldown_glance(
+  snap,
+  "ops-rebuy-h",
+  "#ops-min-hold",
+  "Min hold →",
+  "Rebuy lock length = min hold — raise hold to cool flip-flops; display only."
+) }}
+
+{{ daily_loss_glance(
+  snap,
+  "ops-day-loss-h",
+  "/desk#pretrade-h",
+  "Pre-trade →",
+  "UTC-day loss vs −2% start — soft halt before you chase adds. Display only."
+) }}
+
+{{ concentration_glance(
+  snap,
+  "ops-conc-h",
+  "/desk/book",
+  "Book →",
+  "Largest name vs 30% entry cap before chasing adds — soft size limit. Display only."
+) }}
+
+{{ listed_fund_overlap_glance(
+  snap,
+  "ops-fund-overlap-h",
+  "/desk/book",
+  "Book →",
+  "Same-theme ETF/ETC doubles (gold · silver · US equity) — name overlap ≠ single-name cap. Display only."
+) }}
+
+{{ post_sl_cooldown_glance(
+  snap,
+  "ops-post-sl-h",
+  "/desk#pretrade-h",
+  "Pre-trade →",
+  "Post-SL buy cooldown before flipping knobs — anti revenge refill. Soft WARN only."
+) }}
+
+
+{{ loop_cadence_glance(
+  snap,
+  "ops-loop-cadence-h",
+  "#ops-scan-trade",
+  "Scan / trade →",
+  "Scan vs trade sleep before you assume a hot tick — floors ≥15m / ≥5m. Display only."
+) }}
+
+{{ improve_tick_glance(
+  snap,
+  "ops-improve-tick-h",
+  "#logs-h",
+  "Live logs →",
+  "Last Cursor improve tick before you assume overnight keep-alive is fine — fresh ≤75m · aging ≤3h · else stale. Display only."
+) }}
+
+{{ fee_allowance_glance(
+  snap,
+  "ops-fee-allowance-h",
+  "#ops-fee-preset",
+  "Fee preset →",
+  "Free legs left before you flip fee preset — paid rate after quota; crypto fees not modeled."
+) }}
+
+{{ fee_burn_glance(
+  snap,
+  "ops-fee-burn-h",
+  "#ops-fee-preset",
+  "Fee preset →",
+  "Fee drag vs start and realized P&L before you flip fee preset — high (≥2% or fees>P&L) suggests reset or longer holds."
+) }}
+
+{{ stuck_capital_glance(
+  snap,
+  "ops-stuck-h",
+  "/desk/book",
+  "Book →",
+  "Past min-hold underwater before flipping min-hold hours — capital trapped until TP/SL/trim."
+) }}
+
+{{ min_hold_lock_glance(
+  snap,
+  "ops-min-hold-lock-h",
+  "#ops-min-hold",
+  "Min-hold knob →",
+  "Lots still inside min-hold before flipping hours — cannot rotate/trim yet. Not a gate."
+) }}
+
+{{ postmortem_glance(
+  snap,
+  "ops-post-h",
+  "/desk/book#post-h",
+  "Book rounds →",
+  "Newest closed round before flipping knobs — recent exit memory. Not a gate."
+) }}
+
+</details>
+
+<section class="block system" aria-labelledby="cfg-h">
+  <h2 id="cfg-h">Trader config</h2>
+  <p class="sub">Saved to <code>data/trader_config.json</code>. The paper trader hot-reloads each loop — AI, fees, book limits, promote filter. Scan/trade intervals still come from compose.</p>
+
+  <form id="ops-config" class="ops-form" data-ops-config>
+    <div class="ops-grid">
+      <label class="ops-field">
+        <span class="ops-label">AI mode</span>
+        <select name="ai_mode" id="ops-ai-mode">
+          <option value="off"{% if snap.runtime.ai_mode == "off" %} selected{% endif %}>off — rules only</option>
+          <option value="validate"{% if snap.runtime.ai_mode == "validate" %} selected{% endif %}>validate — LLM checks HIGH signals</option>
+          <option value="full"{% if snap.runtime.ai_mode == "full" %} selected{% endif %}>full — LLM-driven (heavier)</option>
+        </select>
+      </label>
+
+      <label class="ops-field">
+        <span class="ops-label">AI model</span>
+        <input type="text" name="ai_model" id="ops-ai-model"
+               value="{{ snap.runtime.ai_model }}"
+               list="ops-model-suggest"
+               autocomplete="off"
+               spellcheck="false"
+               maxlength="80"
+               placeholder="gemma4:latest" />
+        <datalist id="ops-model-suggest">
+          <option value="gemma4:latest"></option>
+          <option value="qwen3.5:9b"></option>
+        </datalist>
+      </label>
+
+      <label class="ops-field ops-check">
+        <input type="checkbox" name="ai_multi_role" id="ops-multi-role"
+               {% if snap.runtime.ai_multi_role %}checked{% endif %} />
+        <span class="ops-label">Multi-role AI debate (bull / bear / risk)</span>
+      </label>
+
+      <label class="ops-field ops-check">
+        <input type="checkbox" name="regime_gate" id="ops-regime"
+               {% if snap.runtime.regime_gate %}checked{% endif %} />
+        <span class="ops-label" title="SPY is an S&P 500 ETF proxy — SMA uses SPY prices, not the ^GSPC index. Crypto SMA uses Binance BTCUSDT, not Yahoo BTC-USD.">SMA regime gate (SPY ETF / BTCUSDT BN)</span>
+      </label>
+
+      <label class="ops-field ops-check">
+        <input type="checkbox" name="rs_gate" id="ops-rs"
+               {% if snap.runtime.rs_gate %}checked{% endif %} />
+        <span class="ops-label" title="Stock RS benches SPY (ETF proxy), not ^GSPC. Crypto RS benches Binance BTCUSDT, not Yahoo BTC-USD.">Relative-strength gate (vs SPY ETF / BTCUSDT BN)</span>
+      </label>
+
+      <label class="ops-field ops-check">
+        <input type="checkbox" name="breadth_gate" id="ops-breadth"
+               {% if snap.runtime.breadth_gate %}checked{% endif %} />
+        <span class="ops-label">Scan-breadth gate (A/D on leaders)</span>
+      </label>
+
+      <label class="ops-field ops-check">
+        <input type="checkbox" name="promote_experiment_strategy" id="ops-promote"
+               {% if snap.runtime.promote_experiment_strategy %}checked{% endif %} />
+        <span class="ops-label">Promote champion entry filter (experiment_strategy)</span>
+      </label>
+
+      <label class="ops-field">
+        <span class="ops-label">Trading fees (paper)</span>
+        <select name="fee_preset" id="ops-fee-preset">
+          <option value="revolut_standard"{% if snap.runtime.fee_preset == "revolut_standard" %} selected{% endif %}>Revolut Standard · 0.25% · €1 min · 1 free/mo</option>
+          <option value="revolut_plus"{% if snap.runtime.fee_preset == "revolut_plus" %} selected{% endif %}>Revolut Plus · 0.25% · €1 min · 3 free/mo</option>
+          <option value="revolut_ultra"{% if snap.runtime.fee_preset == "revolut_ultra" %} selected{% endif %}>Revolut Ultra / Trading Pro · 0.12% · €1 min · 10 free/mo</option>
+          <option value="binance_like"{% if snap.runtime.fee_preset == "binance_like" %} selected{% endif %}>Spot-like · 0.1% · no floor</option>
+        </select>
+      </label>
+
+      <label class="ops-field">
+        <span class="ops-label">Max positions</span>
+        <input type="number" name="max_positions" id="ops-max-pos"
+               min="1" max="12" step="1"
+               value="{{ snap.runtime.max_positions }}" />
+      </label>
+
+      <label class="ops-field">
+        <span class="ops-label">Min hold (hours)</span>
+        <input type="number" name="min_hold_hours" id="ops-min-hold"
+               min="4" max="168" step="1"
+               value="{{ snap.runtime.min_hold_hours|int }}" />
+      </label>
+      <p class="sub">Min hold traps underwater names until stop/TP/trim — see Overview “stuck” line when past hold and red.</p>
+    </div>
+
+    <div class="ops-actions">
+      <button type="submit" class="ops-save">Save</button>
+      <p id="ops-config-status" class="ops-status" role="status" aria-live="polite"></p>
+    </div>
+    <p class="sub ops-save-about">Hot Saves (book · fees · promote · hold) confirm first — mid-session when US/Xetra cash is open. AI / soft gates save quietly. Trader hot-reloads on the next loop.</p>
+  </form>
+
+  <section class="block soft-allows" aria-labelledby="soft-h">
+    <h3 id="soft-h" class="subhead">Fail-open soft-allows</h3>
+    <p class="sub">When a gate passes because data is missing (unknown / no bars), the trader keeps a short memory here — not a block list. Rows age after {{ snap.soft_allow_glance.aging_hours | int }}h and expire after {{ snap.soft_allow_glance.fresh_hours | int }}h (consolidated on the glance). A <span class="meta">leads · band</span> tag is the glance severity-band concentration — not the same as a row's aging/expired cool-off stamp. A <span class="meta">vs · band</span> tag marks the runner-up gate in that same band (speak-both-sides; not the lead). When a lead speaks, <span class="meta">Lead · gate ×N · band · M%</span> inventories ownership (counts ≠ share); <span class="meta">ahead · +K</span> is how far ahead (share ≠ margin). A runner gets its own <span class="meta">Runner · gate ×K · band · P%</span> line; when ahead already spoke, it also shows <span class="meta">behind · −K</span> (speak-both-sides; same margin, not a lead÷runner ratio). Share Δ / share vs Δ stay on Lead when the glance already spoke them.</p>
+    {% if snap.soft_allows %}
+    {% if snap.soft_allow_glance.lead_gate %}
+    <p class="sub soft-allow-lead-summary">Lead · {{ snap.soft_allow_glance.lead_gate }} ×{{ snap.soft_allow_glance.lead_count }} · {{ snap.soft_allow_glance.lead_band }}{% if snap.soft_allow_glance.lead_share_pct is not none %} · {{ snap.soft_allow_glance.lead_share_pct | round | int }}%{% endif %}{% if snap.soft_allow_glance.lead_margin_severity %} · ahead {{ snap.soft_allow_glance.lead_margin_severity }} · +{{ snap.soft_allow_glance.lead_margin }}{% endif %}{% if snap.soft_allow_glance.lead_share_delta_severity %} · share Δ {{ snap.soft_allow_glance.lead_share_delta_severity }} · {{ "%+d"|format(snap.soft_allow_glance.lead_share_delta_pp | round | int) }}pp{% endif %}{% if snap.soft_allow_glance.lead_share_vs_delta == "align" %} · share vs Δ align · {{ snap.soft_allow_glance.lead_share_vs_delta_ahead }}{% elif snap.soft_allow_glance.lead_share_vs_delta == "clash" %} · share vs Δ clash · ahead {{ snap.soft_allow_glance.lead_share_vs_delta_ahead }} · share {{ snap.soft_allow_glance.lead_share_vs_delta_share }}{% endif %}</p>
+    {% endif %}
+    {% if snap.soft_allow_glance.lead_runner_gate %}
+    <p class="sub soft-allow-runner-summary">Runner · {{ snap.soft_allow_glance.lead_runner_gate }} ×{{ snap.soft_allow_glance.lead_runner_count }} · {{ snap.soft_allow_glance.lead_band }}{% if snap.soft_allow_glance.lead_runner_share_pct is not none %} · {{ snap.soft_allow_glance.lead_runner_share_pct | round | int }}%{% endif %}{% if snap.soft_allow_glance.lead_margin_severity %} · behind {{ snap.soft_allow_glance.lead_margin_severity }} · −{{ snap.soft_allow_glance.lead_margin }}{% endif %}</p>
+    {% endif %}
+    {% if snap.soft_allow_glance.aging_count or snap.soft_allow_glance.expired_count %}
+    <p class="sub soft-allow-expired-summary">{% if snap.soft_allow_glance.fresh_count %}Fresh · {{ snap.soft_allow_glance.fresh_count }}{% if snap.soft_allow_glance.fresh_tally %} · {{ snap.soft_allow_glance.fresh_tally }}{% endif %} · ≤{{ snap.soft_allow_glance.aging_hours | int }}h{% endif %}{% if snap.soft_allow_glance.fresh_count and snap.soft_allow_glance.aging_count %} · {% elif snap.soft_allow_glance.fresh_count and snap.soft_allow_glance.expired_count and not snap.soft_allow_glance.aging_count %} · {% endif %}{% if snap.soft_allow_glance.aging_count %}Aging · {{ snap.soft_allow_glance.aging_count }}{% if snap.soft_allow_glance.aging_tally %} · {{ snap.soft_allow_glance.aging_tally }}{% endif %} · &gt;{{ snap.soft_allow_glance.aging_hours | int }}h{% endif %}{% if snap.soft_allow_glance.aging_count and snap.soft_allow_glance.expired_count %} · {% endif %}{% if snap.soft_allow_glance.expired_count %}Expired · {{ snap.soft_allow_glance.expired_count }}{% if snap.soft_allow_glance.expired_tally %} · {{ snap.soft_allow_glance.expired_tally }}{% endif %} · &gt;{{ snap.soft_allow_glance.fresh_hours | int }}h{% endif %}</p>
+    {% endif %}
+    <ul class="soft-allow-list">
+      {% for e in snap.soft_allows %}
+      <li{% if e.is_lead %} class="soft-allow-lead{% if e.expired %} soft-allow-expired{% elif e.freshness == 'aging' %} soft-allow-aging{% endif %}"{% elif e.is_runner %} class="soft-allow-runner{% if e.expired %} soft-allow-expired{% elif e.freshness == 'aging' %} soft-allow-aging{% endif %}"{% elif e.expired %} class="soft-allow-expired"{% elif e.freshness == 'aging' %} class="soft-allow-aging{% endif %}>
+        <span class="ops-mono">{{ e.at }}</span>
+        {% if e.is_lead %}<span class="meta soft-allow-lead-tag">leads · {{ e.lead_band }}</span>{% elif e.is_runner %}<span class="meta soft-allow-runner-tag">vs · {{ e.runner_band }}</span>{% endif %}
+        {% if e.expired %}<span class="meta soft-allow-expired-tag">expired</span>{% elif e.freshness == 'aging' %}<span class="meta soft-allow-aging-tag">aging</span>{% endif %}
+        <span class="meta">[{{ e.gate }}]</span>
+        <span class="why">{{ e.reason }}</span>
+      </li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No soft-allows recorded yet — gates are either hard-blocking or have full data.</p>
+    {% endif %}
+  </section>
+
+  <dl class="facts runtime-facts">
+    <div>
+      <dt>Python pin</dt>
+      <dd>{% if snap.runtime.python_pin_ok %}{{ snap.runtime.python_running }} · Docker {{ snap.runtime.python_expected }}{% else %}{{ snap.runtime.python_running }} · expected {{ snap.runtime.python_expected }} · <strong>drift</strong>{% endif %}</dd>
+    </div>
+    <div>
+      <dt>Trader version</dt>
+      <dd>{{ snap.runtime.trader_version }}</dd>
+    </div>
+    <div>
+      <dt>Session</dt>
+      <dd>{{ "Weekend · crypto-only" if snap.weekend_mode else "Weekday · stocks + crypto" }}</dd>
+    </div>
+    <div>
+      <dt>LLM backend</dt>
+      <dd>{{ snap.runtime.llm_backend }}</dd>
+    </div>
+    <div>
+      <dt>Ollama host</dt>
+      <dd class="ops-mono">{{ snap.runtime.ollama_host }}</dd>
+    </div>
+    <div>
+      <dt>Cloud API key</dt>
+      <dd>{{ "set" if snap.runtime.llm_key_set else "not set" }}</dd>
+    </div>
+    <div>
+      <dt>Config source</dt>
+      <dd class="ops-config-src{% if snap.runtime.config_file_freshness %} {{ snap.runtime.config_file_freshness }}{% endif %}{% if snap.runtime.config_precedence_tone == 'warn' %} warn{% endif %}" title="Ops saved row wins over compose/env; compact 6h fresh / 2d aging / 10d stale = trader_config.json mtime (fresh &lt;24h · aging &lt;7d · else stale; file exists ≠ recently intended; stale ≥7d is warn — age label ≠ severity); meter = N win · N ok · N env; lead = strictly largest bucket; lead share = ownership % of lead; ahead = lead−#2 (wide ≥2 · thin =1; sole-bucket silent); vs = clear runner bucket · count · runner % of meter (tied runners silent; absolute count ≠ share); when ownership spread is wide/thin the line speaks compact Δ±Npp instead of runner % (wide ≥20pp · thin &lt;10pp; mid silent; API keeps share Δ); Δ±N=W/T = share vs Δ align with count-ahead (same width as Δ±Npp); ×T/%m = clash (ahead spoke, Δ mid); confirms = file matches env; env for = missing from Ops file">{{ snap.runtime.config_precedence_line or snap.runtime.config_source }}</dd>
+    </div>
+    {% if snap.runtime.last_ops_action %}
+    <div>
+      <dt>Last config audit</dt>
+      <dd class="ops-mono{% if snap.runtime.last_ops_outcome in ('error', 'blocked', 'requested') or snap.runtime.last_ops_file_clash_warn or snap.runtime.last_ops_impact_warn %} warn{% endif %}" title="xang1234 audit-before-act: requested row is committed before trader_config.json is written; accepted/error follows. A pending (requested-only) row means the write may have landed without an outcome stamp — warn, not quiet. Fresh pending (inside ~2m) also refuses a second Save (409); stale pending is an aged crash leftover that no longer blocks Save. When trader_config.json is newer than a hanging request, glance speaks no outcome and Save fail-opens (xang1234 #630 no-worker-for-queue adapted — do not wait for an accepted stamp that will not arrive). A no-op Save (no knob change) is refused with skipped · no-op (409) before audit/write — xang1234 refuse-skip-only + skip-says-why. An error row speaks error · write-fail|bad-value|act-fail when recorded (xang1234 #621 show-request-failures — bare error hid why after reload). Parseable stamps speak compact 3h fresh / 2d aging / 10d stale (same floors as saved-row; bare ISO hid Save recency — RyanJHamby/xang1234 age triad). When a terminal outcome age band is known beside Ops file freshness, glance speaks agree · file fresh|aging|stale (same band; agree · file stale warns — dual-stale ≠ quiet) or clash · audit … · file … · audit newer|file newer (disagree names both clocks + which is fresher — file newer hints a hand-edit after last audited Save; clash warns — FinRobot/xang1234 dual-clock + gap-dir + portfolio AI after dual clocks alone hid direction).">{{ snap.runtime.last_ops_action }}</dd>
+    </div>
+    {% endif %}
+    <div>
+      <dt>Max positions</dt>
+      <dd>{{ snap.runtime.max_positions }}</dd>
+    </div>
+    <div>
+      <dt>Min hold</dt>
+      <dd>{{ snap.runtime.min_hold_hours }}h</dd>
+    </div>
+    <div id="ops-scan-trade">
+      <dt>Scan / trade</dt>
+      <dd>{{ snap.runtime.scan_interval_min }}m / {{ snap.runtime.trade_interval_min }}m</dd>
+    </div>
+    <div>
+      <dt>Desk live marks</dt>
+      <dd>{{ "on" if snap.runtime.desk_live_marks else "off" }}</dd>
+    </div>
+    <div>
+      <dt>Paper fees</dt>
+      <dd>{{ "%.2f"|format(snap.runtime.commission_rate * 100) }}%/side · min €{{ "%.2f"|format(snap.runtime.commission_min_eur) }} · {{ snap.runtime.free_legs_per_month }} free/mo</dd>
+    </div>
+    <div>
+      <dt>Free legs left ({{ snap.runtime.fee_allowance_month }})</dt>
+      <dd>{{ snap.runtime.fee_allowance_remaining }} / {{ snap.runtime.free_legs_per_month }}</dd>
+    </div>
+    <div>
+      <dt title="SPY is an S&P 500 ETF proxy, not the ^GSPC index. Crypto regime SMA uses Binance BTCUSDT, not Yahoo BTC-USD (paper symbols).">SPY ETF / BTCUSDT BN regime</dt>
+      <dd title="Close versus SMA is a heuristic sleeve, not a calibrated market-top probability. A close hugging the average, or missing prices, is not a comparable episode. {{ snap.runtime.stock_benchmark_identity or 'SPY · ETF proxy · not ^GSPC' }} · {{ snap.runtime.crypto_benchmark_identity or 'BTCUSDT · Binance pair · not BTC-USD' }}.">{{ snap.runtime.stock_regime_label }} / {{ snap.runtime.crypto_regime_label }}{% if snap.runtime.regime_updated %} · {{ snap.runtime.regime_updated }}{% endif %}</dd>
+    </div>
+    <div id="calm-h">
+      <dt>Paper calm streak</dt>
+      <dd>{{ snap.runtime.calm_streak_days }}/{{ snap.runtime.calm_required_days }} days{% if snap.runtime.calm_ready %} · <strong>compose promote default ready</strong>{% endif %}{% if snap.runtime.calm_detail %} · {{ snap.runtime.calm_detail }}{% endif %}</dd>
+      <dd class="sub">{{ snap.runtime.calm_hint }}</dd>
+    </div>
+  </dl>
+</section>
+
+<section class="block system" aria-labelledby="logs-h">
+  <h2 id="logs-h">Live logs</h2>
+  <p class="sub">Shared <code>data/</code> volume — trader tees to <code>logs/trader.log</code>; overnight loops write <code>run_*.log</code>. No Docker socket.</p>
+  <div class="ops-logs" data-ops-logs>
+    <div class="ops-logs-toolbar">
+      <label class="ops-field">
+        <span class="ops-label">Source</span>
+        <select id="ops-log-source" aria-label="Log source">
+          <option value="trader">trader</option>
+          <option value="watchdog">watchdog loop</option>
+          <option value="watchdog_detail">watchdog detail</option>
+          <option value="ollama">ollama autoresearch</option>
+          <option value="improve">improve loop</option>
+          <option value="github_watch">github watch</option>
+        </select>
+      </label>
+      <p id="ops-log-meta" class="ops-logs-meta" aria-live="polite"></p>
+    </div>
+    <pre id="ops-log-view" class="ops-log-view" aria-label="Live log output" tabindex="0"></pre>
+  </div>
+</section>
+
+<section class="block system" aria-labelledby="obb-h">
+  <h2 id="obb-h">OpenBB Connections</h2>
+  <p class="sub">Backend is local; the browser must allow <code>pro.openbb.co</code> to reach it. Preflight: <code>./scripts/openbb_connection_check.sh</code></p>
+  <ol class="ops-steps">
+    <li>Open <a href="https://pro.openbb.co/app/connections" rel="noopener noreferrer">Connections</a> → Connect Backend</li>
+    <li>URL: <code>http://127.0.0.1:7779</code> (optional <code>X-API-KEY</code> from <code>.env</code>)</li>
+    <li>If Test hangs after a green preflight: allow local network for <code>pro.openbb.co</code>, then Add</li>
+    <li>Apps → AI Stock Checker Paper Desk · details in <a href="https://github.com/raro42/ai-stock-checker/blob/main/OPENBB.md">OPENBB.md</a></li>
+  </ol>
+</section>
+
+<section class="block system" aria-labelledby="sys-h">
+  <h2 id="sys-h">System</h2>
+  <p class="sysline">Portfolio updated {{ snap.portfolio_updated or "—" }} · commission {{ "%.2f"|format(snap.commission_rate_pct) }}%/side · min €{{ "%.2f"|format(snap.commission_min_eur) }} ({{ snap.fee_preset }})</p>
+  <p class="sysline">Scan cycle {{ snap.last_full_cycle or "—" }} · history covers {{ snap.scan_history_symbols }} names</p>
+  <p class="sysline">Tracked symbols {{ snap.scanned_symbols }} · {{ snap.scan_freshness.line if snap.scan_freshness and snap.scan_freshness.ready else ("latest scan " ~ (snap.scan_time or "—")) }}</p>
+  {% if snap.watchdog %}
+  <h3 class="subhead">Watchdog</h3>
+  <pre class="watch" aria-label="Watchdog status">{{ snap.watchdog }}</pre>
+  {% else %}
+  <p class="empty">No watchdog status file.</p>
+  {% endif %}
+</section>
+{% endblock %}
